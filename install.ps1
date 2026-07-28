@@ -38,6 +38,7 @@ $sourceRoot = $PSScriptRoot
 $requiredPaths = @(
     (Join-Path $sourceRoot 'ai-workers.ps1'),
     (Join-Path $sourceRoot 'bin\aiw.ps1'),
+    (Join-Path $sourceRoot 'src\Aiw.Core.psm1'),
     (Join-Path $sourceRoot 'config.example.json'),
     (Join-Path $sourceRoot 'skill-src\dispatch-ai-workers\SKILL.md')
 )
@@ -76,6 +77,7 @@ if ($PSCmdlet.ShouldProcess($installRootFull, 'install AI CLI Orchestrator')) {
         }
     }
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'bin\aiw.ps1') -Destination (Join-Path $binDirectory 'aiw.ps1') -Force
+    Copy-Item -LiteralPath (Join-Path $sourceRoot 'src') -Destination (Join-Path $appDirectory 'src') -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'skill-src') -Destination (Join-Path $appDirectory 'skill-src') -Recurse -Force
 
     $launcherPath = Join-Path $binDirectory 'aiw.ps1'

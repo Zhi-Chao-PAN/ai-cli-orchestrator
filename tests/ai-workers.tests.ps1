@@ -398,6 +398,31 @@ try {
         Assert-True -Condition $launcherResult.output.fixture -Message 'Launcher lost worker output'
     }
 
+    Invoke-Test -Name 'Catalog lists reviewed adapters through the public launcher' -Body {
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $catalogOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            catalog `
+            -Json
+        $catalogExitCode = $LASTEXITCODE
+        $catalog = $catalogOutput | ConvertFrom-Json
+        $adapterIds = @($catalog.adapters | ForEach-Object { $_.id })
+
+        Assert-Equal -Expected 0 -Actual $catalogExitCode -Message 'Catalog command returned a non-zero exit code'
+        Assert-Equal -Expected 2 -Actual $catalog.schemaVersion -Message 'Catalog schema changed'
+        Assert-True -Condition $catalog.ok -Message 'Catalog command failed'
+        Assert-Equal -Expected 'catalog' -Actual $catalog.command -Message 'Catalog command name changed'
+        Assert-Equal -Expected 0 -Actual $catalog.exitCode -Message 'Catalog payload exit code changed'
+        Assert-Equal -Expected 3 -Actual $adapterIds.Count -Message 'Catalog adapter count changed'
+        Assert-Equal -Expected 'claude-code/v1' -Actual $adapterIds[0] -Message 'Claude adapter ID changed'
+        Assert-Equal -Expected 'antigravity/v1' -Actual $adapterIds[1] -Message 'Antigravity adapter ID changed'
+        Assert-Equal -Expected 'minimax-cli/v1' -Actual $adapterIds[2] -Message 'MiniMax adapter ID changed'
+    }
+
     Write-Output ('All {0} tests passed.' -f $script:Passed)
 } finally {
     $resolvedTempBase = (Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())).Path

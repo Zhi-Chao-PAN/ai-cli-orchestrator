@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('status', 'doctor', 'ark', 'agent', 'google', 'minimax', 'quota')]
+    [ValidateSet('status', 'doctor', 'ark', 'agent', 'google', 'minimax', 'quota', 'catalog')]
     [string]$Command = 'status',
 
     [Parameter(Position = 1)]
@@ -35,6 +35,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$script:AiwCoreModulePath = Join-Path $PSScriptRoot 'src\Aiw.Core.psm1'
+Import-Module -Name $script:AiwCoreModulePath -Force -ErrorAction Stop
 
 $script:AiwVersion = '0.2.0'
 $script:WorkerConfig = $null
@@ -1105,6 +1108,42 @@ function Invoke-MiniMaxQuota {
         Write-WorkerResult -Worker 'minimax-quota' -SelectedModel $null -Attempts $attempts -Result $result
     } finally {
         Restore-EnvironmentVariable -Name 'MINIMAX_BASE_URL' -PreviousValue $previousBaseUrl
+    }
+}
+
+if ($MyInvocation.InvocationName -ne '.' -and $Command -eq 'catalog') {
+    try {
+        $coreResult = Invoke-AiwCore -Request ([pscustomobject]@{
+            command = 'catalog'
+        })
+        if ($Json) {
+            ConvertTo-Json -InputObject $coreResult -Depth 20
+        } else {
+            $coreResult.adapters |
+                Select-Object id, displayName, promptTransport, @{Name = 'capabilities'; Expression = { $_.capabilities -join ', ' }} |
+                Format-Table -AutoSize
+        }
+        exit [int]$coreResult.exitCode
+    } catch {
+        if ($Json) {
+            [pscustomobject]@{
+                schemaVersion = 2
+                ok = $false
+                command = 'catalog'
+                exitCode = 1
+                failureKind = 'wrapper_error'
+                adapters = @()
+                error = [pscustomobject]@{
+                    code = 'WRAPPER_ERROR'
+                    message = 'Catalog request failed.'
+                }
+                diagnostics = Get-SanitizedDiagnostics -Text $_.Exception.Message
+                warnings = @()
+            } | ConvertTo-Json -Depth 20
+        } else {
+            Write-Error (Get-SanitizedDiagnostics -Text $_.Exception.Message) -ErrorAction Continue
+        }
+        exit 1
     }
 }
 
