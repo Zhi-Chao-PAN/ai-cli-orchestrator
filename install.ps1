@@ -85,7 +85,12 @@ if ($PSCmdlet.ShouldProcess($installRootFull, 'install AI CLI Orchestrator')) {
 param()
 $entryPoint = Join-Path (Split-Path -Parent $PSScriptRoot) 'app\ai-workers.ps1'
 & $entryPoint @args
-if (-not $?) {
+$entryPointSucceeded = $?
+$entryPointExitCode = Get-Variable -Name LASTEXITCODE -ValueOnly -ErrorAction SilentlyContinue
+if ($null -ne $entryPointExitCode) {
+    exit [int]$entryPointExitCode
+}
+if (-not $entryPointSucceeded) {
     exit 1
 }
 exit 0

@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('status', 'doctor', 'ark', 'agent', 'google', 'minimax', 'quota', 'catalog')]
+    [ValidateSet('status', 'doctor', 'ark', 'agent', 'google', 'minimax', 'quota', 'catalog', 'config')]
     [string]$Command = 'status',
 
     [Parameter(Position = 1)]
@@ -19,6 +19,10 @@ param(
     [string]$AgentModel,
 
     [string]$ConfigPath,
+
+    [string]$Action,
+
+    [string]$Destination,
 
     [ValidateRange(1, 16777216)]
     [int]$MaxPromptBytes = 1048576,
@@ -1111,13 +1115,30 @@ function Invoke-MiniMaxQuota {
     }
 }
 
-if ($MyInvocation.InvocationName -ne '.' -and $Command -eq 'catalog') {
+if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config')) {
     try {
-        $coreResult = Invoke-AiwCore -Request ([pscustomobject]@{
-            command = 'catalog'
-        })
+        $coreRequest = if ($Command -eq 'catalog') {
+            [pscustomobject]@{
+                command = 'catalog'
+            }
+        } else {
+            if ($Action -ne 'validate') {
+                throw 'The config command currently requires -Action validate.'
+            }
+            [pscustomobject]@{
+                command = 'config.validate'
+                configPath = $ConfigPath
+            }
+        }
+        $coreResult = Invoke-AiwCore -Request $coreRequest
         if ($Json) {
             ConvertTo-Json -InputObject $coreResult -Depth 20
+        } elseif ($Command -eq 'config') {
+            if ($coreResult.ok) {
+                Write-Output ('Configuration is valid (schema {0}).' -f $coreResult.configSchemaVersion)
+            } else {
+                $coreResult.errors | Format-Table -AutoSize
+            }
         } else {
             $coreResult.adapters |
                 Select-Object id, displayName, promptTransport, @{Name = 'capabilities'; Expression = { $_.capabilities -join ', ' }} |
@@ -1129,13 +1150,14 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -eq 'catalog') {
             [pscustomobject]@{
                 schemaVersion = 2
                 ok = $false
-                command = 'catalog'
+                command = $Command
+                action = if ($Command -eq 'config') { $Action } else { $null }
                 exitCode = 1
                 failureKind = 'wrapper_error'
-                adapters = @()
+                errors = @()
                 error = [pscustomobject]@{
                     code = 'WRAPPER_ERROR'
-                    message = 'Catalog request failed.'
+                    message = 'Core request failed.'
                 }
                 diagnostics = Get-SanitizedDiagnostics -Text $_.Exception.Message
                 warnings = @()

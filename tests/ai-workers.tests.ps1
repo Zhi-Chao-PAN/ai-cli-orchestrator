@@ -423,6 +423,87 @@ try {
         Assert-Equal -Expected 'minimax-cli/v1' -Actual $adapterIds[2] -Message 'MiniMax adapter ID changed'
     }
 
+    Invoke-Test -Name 'Config validate accepts the neutral schema v2 shape' -Body {
+        $configPath = Join-Path $tempRoot 'neutral-v2.json'
+        $neutralConfig = [pscustomobject]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [pscustomobject]@{}
+            profiles = [pscustomobject]@{}
+            routes = [pscustomobject]@{}
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $neutralConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $validationOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            config `
+            -Action validate `
+            -ConfigPath $configPath `
+            -Json
+        $validationExitCode = $LASTEXITCODE
+        $validation = $validationOutput | ConvertFrom-Json
+
+        Assert-Equal -Expected 0 -Actual $validationExitCode -Message 'Neutral config validation failed'
+        Assert-Equal -Expected 2 -Actual $validation.schemaVersion -Message 'Config result schema changed'
+        Assert-True -Condition $validation.ok -Message 'Neutral config was rejected'
+        Assert-Equal -Expected 'config' -Actual $validation.command -Message 'Config command name changed'
+        Assert-Equal -Expected 'validate' -Actual $validation.action -Message 'Config action changed'
+        Assert-Equal -Expected 2 -Actual $validation.configSchemaVersion -Message 'Config schema was not reported'
+        Assert-Equal -Expected 0 -Actual $validation.exitCode -Message 'Config payload exit code changed'
+        Assert-Equal -Expected 0 -Actual @($validation.errors).Count -Message 'Neutral config returned validation errors'
+    }
+
+    Invoke-Test -Name 'Config validate rejects command fields without echoing values' -Body {
+        $configPath = Join-Path $tempRoot 'forbidden-command-v2.json'
+        $secretSentinel = 'DO_NOT_ECHO_CONFIG_SENTINEL'
+        $forbiddenConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{}
+            profiles = [ordered]@{}
+            routes = [ordered]@{}
+            command = $secretSentinel
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $forbiddenConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $validationOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            config `
+            -Action validate `
+            -ConfigPath $configPath `
+            -Json
+        $validationExitCode = $LASTEXITCODE
+        $validationText = @($validationOutput) -join [Environment]::NewLine
+        $validation = $validationText | ConvertFrom-Json
+
+        Assert-Equal -Expected 2 -Actual $validationExitCode -Message 'Forbidden config returned the wrong exit code'
+        Assert-True -Condition (-not $validation.ok) -Message 'Forbidden command field was accepted'
+        Assert-Equal -Expected 'config_invalid' -Actual $validation.failureKind -Message 'Forbidden field failure kind changed'
+        Assert-Equal -Expected 'FIELD_FORBIDDEN' -Actual $validation.errors[0].code -Message 'Forbidden field error code changed'
+        Assert-Equal -Expected '$.command' -Actual $validation.errors[0].path -Message 'Forbidden field path changed'
+        Assert-True -Condition (-not $validationText.Contains($secretSentinel)) -Message 'Rejected config value leaked into JSON output'
+    }
+
     Write-Output ('All {0} tests passed.' -f $script:Passed)
 } finally {
     $resolvedTempBase = (Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())).Path

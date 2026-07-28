@@ -9,7 +9,12 @@ if (-not (Test-Path -LiteralPath $entryPoint -PathType Leaf)) {
 }
 
 & $entryPoint @args
-if (-not $?) {
+$entryPointSucceeded = $?
+$entryPointExitCode = Get-Variable -Name LASTEXITCODE -ValueOnly -ErrorAction SilentlyContinue
+if ($null -ne $entryPointExitCode) {
+    exit [int]$entryPointExitCode
+}
+if (-not $entryPointSucceeded) {
     exit 1
 }
 exit 0
