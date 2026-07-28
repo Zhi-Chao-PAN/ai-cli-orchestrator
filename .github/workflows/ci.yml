@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run regression suite
+        shell: powershell
+        run: ./tests/ai-workers.tests.ps1
+      - name: Check public files for credential-like literals
+        shell: powershell
+        run: |
+          $matches = Select-String -Path ai-workers.ps1,README.md,README.zh-CN.md,config.example.json,skill-src/dispatch-ai-workers/SKILL.md -Pattern 'sk-[A-Za-z0-9_-]{8,}' -AllMatches
+          if ($matches) { throw 'Credential-like literal found in a public file.' }
+
+  windows-pwsh:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run regression suite
+        shell: pwsh
+        run: ./tests/ai-workers.tests.ps1
+      - name: Check public files for credential-like literals
+        shell: pwsh
+        run: |
+          $matches = Select-String -Path ai-workers.ps1,README.md,README.zh-CN.md,config.example.json,skill-src/dispatch-ai-workers/SKILL.md -Pattern 'sk-[A-Za-z0-9_-]{8,}' -AllMatches
+          if ($matches) { throw 'Credential-like literal found in a public file.' }
