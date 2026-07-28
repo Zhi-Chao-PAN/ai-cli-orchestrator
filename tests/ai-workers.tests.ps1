@@ -592,6 +592,232 @@ try {
         Assert-True -Condition (-not $validationText.Contains($secretSentinel)) -Message 'Secret-like field value leaked into JSON output'
     }
 
+    Invoke-Test -Name 'Config validate prevents adapter capability escalation' -Body {
+        $configPath = Join-Path $tempRoot 'capability-escalation-v2.json'
+        $capabilityConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                stateless = [ordered]@{
+                    adapter = 'minimax-cli/v1'
+                    enabled = $true
+                    path = $null
+                    model = 'fixture-model'
+                    capabilities = @('text.reason', 'workspace.read')
+                    settings = [ordered]@{ region = 'cn' }
+                }
+            }
+            profiles = [ordered]@{}
+            routes = [ordered]@{}
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $capabilityConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $validationOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            config `
+            -Action validate `
+            -ConfigPath $configPath `
+            -Json
+        $validationExitCode = $LASTEXITCODE
+        $validation = (@($validationOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+        Assert-Equal -Expected 2 -Actual $validationExitCode -Message 'Capability escalation returned the wrong exit code'
+        Assert-Equal -Expected 'CAPABILITY_NOT_SUPPORTED' -Actual $validation.errors[0].code -Message 'Capability escalation error code changed'
+        Assert-Equal -Expected '$.workers.stateless.capabilities[1]' -Actual $validation.errors[0].path -Message 'Capability escalation path changed'
+    }
+
+    Invoke-Test -Name 'Config validate prevents routes from defaulting to write' -Body {
+        $configPath = Join-Path $tempRoot 'route-default-write-v2.json'
+        $routeConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = 'reason'
+            defaultProfile = $null
+            workers = [ordered]@{
+                stateless = [ordered]@{
+                    adapter = 'minimax-cli/v1'
+                    enabled = $true
+                    path = $null
+                    model = 'fixture-model'
+                    capabilities = @('text.reason')
+                    settings = [ordered]@{ region = 'cn' }
+                }
+            }
+            profiles = [ordered]@{
+                reasoning = [ordered]@{
+                    workers = @('stateless')
+                    fallback = [ordered]@{ maxAttempts = 1; on = @() }
+                }
+            }
+            routes = [ordered]@{
+                reason = [ordered]@{
+                    profile = 'reasoning'
+                    requiredCapabilities = @('text.reason')
+                    defaultMode = 'write'
+                    allowedModes = @('read', 'write')
+                }
+            }
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $routeConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $validationOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            config `
+            -Action validate `
+            -ConfigPath $configPath `
+            -Json
+        $validationExitCode = $LASTEXITCODE
+        $validation = (@($validationOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+        Assert-Equal -Expected 2 -Actual $validationExitCode -Message 'Write-default route returned the wrong exit code'
+        Assert-Equal -Expected 'ROUTE_DEFAULT_WRITE_FORBIDDEN' -Actual $validation.errors[0].code -Message 'Write-default route error code changed'
+        Assert-Equal -Expected '$.routes.reason.defaultMode' -Actual $validation.errors[0].path -Message 'Write-default route path changed'
+    }
+
+    Invoke-Test -Name 'Run invokes a named Claude worker through the public launcher' -Body {
+        $workerPath = Join-Path $tempRoot 'claude.ps1'
+        $configPath = Join-Path $tempRoot 'run-worker-v2.json'
+        $promptPath = Join-Path $tempRoot 'run-worker-prompt.md'
+        $expectedPrompt = 'named worker UTF-8 ' + [string][char]0x7B2C + [string][char]0x4E8C
+        [System.IO.File]::WriteAllText(
+            $workerPath,
+            '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); [Console]::Write([Console]::In.ReadToEnd())',
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        [System.IO.File]::WriteAllText(
+            $promptPath,
+            $expectedPrompt,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $runConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                'claude-fixture' = [ordered]@{
+                    adapter = 'claude-code/v1'
+                    enabled = $true
+                    path = $workerPath
+                    model = 'fixture-model'
+                    capabilities = @('text.reason', 'workspace.read')
+                    settings = [ordered]@{}
+                }
+            }
+            profiles = [ordered]@{}
+            routes = [ordered]@{}
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $runConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $runOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            run `
+            -Worker 'claude-fixture' `
+            -PromptFile $promptPath `
+            -Mode read `
+            -WorkingDirectory $tempRoot `
+            -ConfigPath $configPath `
+            -TimeoutSeconds 30 `
+            -Json
+        $runExitCode = $LASTEXITCODE
+        $run = (@($runOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+        Assert-Equal -Expected 0 -Actual $runExitCode -Message 'Named worker run returned a non-zero exit code'
+        Assert-Equal -Expected 2 -Actual $run.schemaVersion -Message 'Run schema changed'
+        Assert-True -Condition $run.ok -Message 'Named worker run failed'
+        Assert-Equal -Expected 'run' -Actual $run.command -Message 'Run command changed'
+        Assert-Equal -Expected 'claude-fixture' -Actual $run.selection.worker -Message 'Run selected the wrong worker'
+        Assert-Equal -Expected 'claude-code/v1' -Actual $run.selection.adapter -Message 'Run selected the wrong adapter'
+        Assert-Equal -Expected 'fixture-model' -Actual $run.selection.model -Message 'Run selected the wrong model'
+        Assert-Equal -Expected $expectedPrompt -Actual $run.output -Message 'Run changed the UTF-8 work order'
+        Assert-Equal -Expected 1 -Actual @($run.attempts).Count -Message 'Direct worker run should have one attempt'
+    }
+
+    Invoke-Test -Name 'Run rejects unsupported workspace capability before process creation' -Body {
+        $workerPath = Join-Path $tempRoot 'mmx.ps1'
+        $markerPath = Join-Path $tempRoot 'minimax-should-not-start.marker'
+        $configPath = Join-Path $tempRoot 'run-capability-denied-v2.json'
+        $promptPath = Join-Path $tempRoot 'run-capability-denied.md'
+        [System.IO.File]::WriteAllText(
+            $workerPath,
+            ('[System.IO.File]::WriteAllText(''{0}'', ''started'')' -f $markerPath.Replace("'", "''")),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        [System.IO.File]::WriteAllText($promptPath, 'bounded task')
+        $runConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                stateless = [ordered]@{
+                    adapter = 'minimax-cli/v1'
+                    enabled = $true
+                    path = $workerPath
+                    model = 'fixture-model'
+                    capabilities = @('text.reason')
+                    settings = [ordered]@{ region = 'cn' }
+                }
+            }
+            profiles = [ordered]@{}
+            routes = [ordered]@{}
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $runConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $runOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            run `
+            -Worker 'stateless' `
+            -RequireCapability 'workspace.read' `
+            -PromptFile $promptPath `
+            -Mode read `
+            -WorkingDirectory $tempRoot `
+            -ConfigPath $configPath `
+            -TimeoutSeconds 30 `
+            -Json
+        $runExitCode = $LASTEXITCODE
+        $run = (@($runOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+        Assert-Equal -Expected 2 -Actual $runExitCode -Message 'Capability denial returned the wrong exit code'
+        Assert-True -Condition (-not $run.ok) -Message 'Unsupported workspace capability was accepted'
+        Assert-Equal -Expected 'CAPABILITY_DENIED' -Actual $run.error.code -Message 'Capability denial error code changed'
+        Assert-True -Condition (-not (Test-Path -LiteralPath $markerPath)) -Message 'Capability-denied worker process was started'
+    }
+
     Write-Output ('All {0} tests passed.' -f $script:Passed)
 } finally {
     $resolvedTempBase = (Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())).Path

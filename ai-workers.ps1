@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('status', 'doctor', 'ark', 'agent', 'google', 'minimax', 'quota', 'catalog', 'config')]
+    [ValidateSet('status', 'doctor', 'ark', 'agent', 'google', 'minimax', 'quota', 'catalog', 'config', 'run')]
     [string]$Command = 'status',
 
     [Parameter(Position = 1)]
@@ -23,6 +23,14 @@ param(
     [string]$Action,
 
     [string]$Destination,
+
+    [string]$Worker,
+
+    [string]$Profile,
+
+    [string]$Route,
+
+    [string[]]$RequireCapability,
 
     [ValidateRange(1, 16777216)]
     [int]$MaxPromptBytes = 1048576,
@@ -1115,13 +1123,13 @@ function Invoke-MiniMaxQuota {
     }
 }
 
-if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config')) {
+if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config', 'run')) {
     try {
         $coreRequest = if ($Command -eq 'catalog') {
             [pscustomobject]@{
                 command = 'catalog'
             }
-        } else {
+        } elseif ($Command -eq 'config') {
             if ($Action -ne 'validate') {
                 throw 'The config command currently requires -Action validate.'
             }
@@ -1129,8 +1137,107 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
                 command = 'config.validate'
                 configPath = $ConfigPath
             }
+        } else {
+            $resolvedDirectory = Resolve-WorkerDirectory -Path $WorkingDirectory
+            $promptText = Resolve-PromptText -InlinePrompt $Prompt -FilePath $PromptFile
+            if ([string]::IsNullOrWhiteSpace($promptText)) {
+                throw 'The run command requires either -Prompt or -PromptFile.'
+            }
+            [pscustomobject]@{
+                command = 'run.plan'
+                configPath = $ConfigPath
+                worker = $Worker
+                profile = $Profile
+                route = $Route
+                mode = $Mode
+                requiredCapabilities = @($RequireCapability)
+                promptText = $promptText
+                workingDirectory = $resolvedDirectory
+                timeoutSeconds = $TimeoutSeconds
+                noFallback = [bool]$NoFallback
+            }
         }
         $coreResult = Invoke-AiwCore -Request $coreRequest
+        if ($Command -eq 'run' -and $coreResult.ok) {
+            $environmentPreviousValues = @{}
+            try {
+                foreach ($property in $coreResult.plan.environmentOverlay.PSObject.Properties) {
+                    $environmentPreviousValues[$property.Name] = [Environment]::GetEnvironmentVariable($property.Name)
+                    Set-Item -LiteralPath ('Env:{0}' -f $property.Name) -Value ([string]$property.Value)
+                }
+                $nativeResult = Invoke-NativeWorker `
+                    -FilePath $coreResult.plan.filePath `
+                    -Arguments @($coreResult.plan.arguments) `
+                    -Directory $coreResult.plan.workingDirectory `
+                    -ProcessTimeoutSeconds $TimeoutSeconds `
+                    -StandardInputText $coreResult.plan.standardInputText `
+                    -AllowBatchWorker:$coreResult.plan.allowBatchWorker
+            } finally {
+                foreach ($name in $environmentPreviousValues.Keys) {
+                    Restore-EnvironmentVariable -Name $name -PreviousValue $environmentPreviousValues[$name]
+                }
+            }
+
+            $failureKind = Get-WorkerFailureKind -Result $nativeResult
+            $publicExitCode = if ($nativeResult.ExitCode -eq 0) {
+                0
+            } elseif ($nativeResult.TimedOut) {
+                124
+            } elseif ($nativeResult.ReadTimedOut) {
+                125
+            } else {
+                1
+            }
+            $runResult = [pscustomobject]@{
+                schemaVersion = 2
+                ok = ($nativeResult.ExitCode -eq 0)
+                command = 'run'
+                request = $coreResult.request
+                selection = $coreResult.selection
+                exitCode = $publicExitCode
+                timedOut = $nativeResult.TimedOut
+                readTimedOut = $nativeResult.ReadTimedOut
+                terminationSucceeded = $nativeResult.TerminationSucceeded
+                durationMs = $nativeResult.DurationMs
+                failureKind = $failureKind
+                skipped = @()
+                attempts = @(
+                    [pscustomobject]@{
+                        worker = $coreResult.selection.worker
+                        adapter = $coreResult.selection.adapter
+                        model = $coreResult.selection.model
+                        childExitCode = $nativeResult.ExitCode
+                        failureKind = $failureKind
+                        timedOut = $nativeResult.TimedOut
+                        readTimedOut = $nativeResult.ReadTimedOut
+                        durationMs = $nativeResult.DurationMs
+                    }
+                )
+                output = Convert-OutputValue -Text ([string]$nativeResult.StandardOutput)
+                error = if ($nativeResult.ExitCode -eq 0) {
+                    $null
+                } else {
+                    [pscustomobject]@{
+                        code = $failureKind.ToUpperInvariant()
+                        phase = 'execution'
+                        message = 'Worker execution failed.'
+                    }
+                }
+                diagnostics = Get-SanitizedDiagnostics -Text ([string]$nativeResult.StandardError)
+                warnings = @()
+            }
+            if ($Json) {
+                ConvertTo-Json -InputObject $runResult -Depth 20
+            } else {
+                if (-not [string]::IsNullOrWhiteSpace([string]$nativeResult.StandardOutput)) {
+                    Write-Output $nativeResult.StandardOutput
+                }
+                if (-not [string]::IsNullOrWhiteSpace([string]$runResult.diagnostics)) {
+                    Write-Warning $runResult.diagnostics
+                }
+            }
+            exit $publicExitCode
+        }
         if ($Json) {
             ConvertTo-Json -InputObject $coreResult -Depth 20
         } elseif ($Command -eq 'config') {
@@ -1139,7 +1246,7 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
             } else {
                 $coreResult.errors | Format-Table -AutoSize
             }
-        } else {
+        } elseif ($Command -eq 'catalog') {
             $coreResult.adapters |
                 Select-Object id, displayName, promptTransport, @{Name = 'capabilities'; Expression = { $_.capabilities -join ', ' }} |
                 Format-Table -AutoSize
@@ -1152,11 +1259,11 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
                 ok = $false
                 command = $Command
                 action = if ($Command -eq 'config') { $Action } else { $null }
-                exitCode = 1
-                failureKind = 'wrapper_error'
+                exitCode = if ($Command -eq 'run') { 2 } else { 1 }
+                failureKind = if ($Command -eq 'run') { 'invalid_request' } else { 'wrapper_error' }
                 errors = @()
                 error = [pscustomobject]@{
-                    code = 'WRAPPER_ERROR'
+                    code = if ($Command -eq 'run') { 'INVALID_REQUEST' } else { 'WRAPPER_ERROR' }
                     message = 'Core request failed.'
                 }
                 diagnostics = Get-SanitizedDiagnostics -Text $_.Exception.Message
@@ -1165,7 +1272,7 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
         } else {
             Write-Error (Get-SanitizedDiagnostics -Text $_.Exception.Message) -ErrorAction Continue
         }
-        exit 1
+        exit $(if ($Command -eq 'run') { 2 } else { 1 })
     }
 }
 

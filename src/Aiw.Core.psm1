@@ -148,6 +148,484 @@ function Get-AiwUnsafeFieldErrors {
     }
 }
 
+function Get-AiwAdapterDescriptor {
+    param([Parameter(Mandatory)][string]$Id)
+
+    return @(Get-AiwAdapterCatalog | Where-Object { $_.id -eq $Id } | Select-Object -First 1)[0]
+}
+
+function Get-AiwWorkerValidationErrors {
+    param(
+        [AllowNull()]
+        [object]$Workers
+    )
+
+    if ($null -eq $Workers -or $Workers -isnot [pscustomobject]) {
+        Write-Output ([pscustomobject]@{
+            code = 'FIELD_TYPE_INVALID'
+            path = '$.workers'
+            message = 'Workers must be a JSON object.'
+        })
+        return
+    }
+    if (@($Workers.PSObject.Properties).Count -gt 128) {
+        Write-Output ([pscustomobject]@{
+            code = 'CONFIG_LIMIT_EXCEEDED'
+            path = '$.workers'
+            message = 'Worker count exceeds the supported limit.'
+        })
+        return
+    }
+
+    $allowedWorkerFields = @('adapter', 'enabled', 'path', 'model', 'capabilities', 'settings')
+    foreach ($workerProperty in $Workers.PSObject.Properties) {
+        $workerId = $workerProperty.Name
+        $workerPath = '$.workers.' + $workerId
+        if ($workerId -notmatch '^[a-z][a-z0-9._-]{0,63}$') {
+            Write-Output ([pscustomobject]@{
+                code = 'ID_INVALID'
+                path = $workerPath
+                message = 'Worker ID is invalid.'
+            })
+            continue
+        }
+        $worker = $workerProperty.Value
+        if ($worker -isnot [pscustomobject]) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = $workerPath
+                message = 'Worker definition must be a JSON object.'
+            })
+            continue
+        }
+        foreach ($property in $worker.PSObject.Properties) {
+            if ($allowedWorkerFields -notcontains $property.Name) {
+                Write-Output ([pscustomobject]@{
+                    code = 'FIELD_UNKNOWN'
+                    path = $workerPath + '.' + $property.Name
+                    message = 'Worker field is not supported.'
+                })
+            }
+        }
+
+        $adapterProperty = $worker.PSObject.Properties['adapter']
+        $adapterId = if ($null -eq $adapterProperty) { $null } else { [string]$adapterProperty.Value }
+        $adapter = if ([string]::IsNullOrWhiteSpace($adapterId)) {
+            $null
+        } else {
+            Get-AiwAdapterDescriptor -Id $adapterId
+        }
+        if ($null -eq $adapter) {
+            Write-Output ([pscustomobject]@{
+                code = 'ADAPTER_UNKNOWN'
+                path = $workerPath + '.adapter'
+                message = 'Worker adapter is missing or unsupported.'
+            })
+            continue
+        }
+
+        $capabilitiesProperty = $worker.PSObject.Properties['capabilities']
+        if ($null -ne $capabilitiesProperty -and $null -ne $capabilitiesProperty.Value) {
+            $capabilities = @($capabilitiesProperty.Value)
+            for ($index = 0; $index -lt $capabilities.Count; $index++) {
+                $capability = [string]$capabilities[$index]
+                if ($adapter.capabilities -notcontains $capability) {
+                    Write-Output ([pscustomobject]@{
+                        code = 'CAPABILITY_NOT_SUPPORTED'
+                        path = ('{0}.capabilities[{1}]' -f $workerPath, $index)
+                        message = 'Capability is not supported by the selected adapter.'
+                    })
+                }
+            }
+        }
+    }
+}
+
+function Get-AiwProfileValidationErrors {
+    param(
+        [AllowNull()][object]$Profiles,
+        [AllowNull()][object]$Workers
+    )
+
+    if ($null -eq $Profiles -or $Profiles -isnot [pscustomobject]) {
+        Write-Output ([pscustomobject]@{
+            code = 'FIELD_TYPE_INVALID'
+            path = '$.profiles'
+            message = 'Profiles must be a JSON object.'
+        })
+        return
+    }
+    if (@($Profiles.PSObject.Properties).Count -gt 64) {
+        Write-Output ([pscustomobject]@{
+            code = 'CONFIG_LIMIT_EXCEEDED'
+            path = '$.profiles'
+            message = 'Profile count exceeds the supported limit.'
+        })
+        return
+    }
+
+    foreach ($profileProperty in $Profiles.PSObject.Properties) {
+        $profileId = $profileProperty.Name
+        $profilePath = '$.profiles.' + $profileId
+        if ($profileId -notmatch '^[a-z][a-z0-9._-]{0,63}$') {
+            Write-Output ([pscustomobject]@{
+                code = 'ID_INVALID'
+                path = $profilePath
+                message = 'Profile ID is invalid.'
+            })
+            continue
+        }
+        $profile = $profileProperty.Value
+        if ($profile -isnot [pscustomobject]) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = $profilePath
+                message = 'Profile definition must be a JSON object.'
+            })
+            continue
+        }
+        foreach ($property in $profile.PSObject.Properties) {
+            if (@('workers', 'fallback') -notcontains $property.Name) {
+                Write-Output ([pscustomobject]@{
+                    code = 'FIELD_UNKNOWN'
+                    path = $profilePath + '.' + $property.Name
+                    message = 'Profile field is not supported.'
+                })
+            }
+        }
+        $workerListProperty = $profile.PSObject.Properties['workers']
+        $workerList = @(
+            if ($null -ne $workerListProperty) {
+                $workerListProperty.Value
+            }
+        )
+        if ($workerList.Count -eq 0) {
+            Write-Output ([pscustomobject]@{
+                code = 'PROFILE_EMPTY'
+                path = $profilePath + '.workers'
+                message = 'Profile must reference at least one worker.'
+            })
+            continue
+        }
+        for ($index = 0; $index -lt $workerList.Count; $index++) {
+            $workerId = [string]$workerList[$index]
+            if ($null -eq $Workers -or $null -eq $Workers.PSObject.Properties[$workerId]) {
+                Write-Output ([pscustomobject]@{
+                    code = 'WORKER_NOT_FOUND'
+                    path = ('{0}.workers[{1}]' -f $profilePath, $index)
+                    message = 'Profile references an unknown worker.'
+                })
+            }
+        }
+    }
+}
+
+function Get-AiwRouteValidationErrors {
+    param(
+        [AllowNull()][object]$Routes,
+        [AllowNull()][object]$Profiles
+    )
+
+    if ($null -eq $Routes -or $Routes -isnot [pscustomobject]) {
+        Write-Output ([pscustomobject]@{
+            code = 'FIELD_TYPE_INVALID'
+            path = '$.routes'
+            message = 'Routes must be a JSON object.'
+        })
+        return
+    }
+    if (@($Routes.PSObject.Properties).Count -gt 64) {
+        Write-Output ([pscustomobject]@{
+            code = 'CONFIG_LIMIT_EXCEEDED'
+            path = '$.routes'
+            message = 'Route count exceeds the supported limit.'
+        })
+        return
+    }
+
+    $knownCapabilities = @(
+        Get-AiwAdapterCatalog |
+            ForEach-Object { $_.capabilities } |
+            Select-Object -Unique
+    )
+    foreach ($routeProperty in $Routes.PSObject.Properties) {
+        $routeId = $routeProperty.Name
+        $routePath = '$.routes.' + $routeId
+        if ($routeId -notmatch '^[a-z][a-z0-9._-]{0,63}$') {
+            Write-Output ([pscustomobject]@{
+                code = 'ID_INVALID'
+                path = $routePath
+                message = 'Route ID is invalid.'
+            })
+            continue
+        }
+        $route = $routeProperty.Value
+        if ($route -isnot [pscustomobject]) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = $routePath
+                message = 'Route definition must be a JSON object.'
+            })
+            continue
+        }
+        foreach ($property in $route.PSObject.Properties) {
+            if (@('profile', 'requiredCapabilities', 'defaultMode', 'allowedModes') -notcontains $property.Name) {
+                Write-Output ([pscustomobject]@{
+                    code = 'FIELD_UNKNOWN'
+                    path = $routePath + '.' + $property.Name
+                    message = 'Route field is not supported.'
+                })
+            }
+        }
+        $profileProperty = $route.PSObject.Properties['profile']
+        $profileId = if ($null -eq $profileProperty) { $null } else { [string]$profileProperty.Value }
+        if ([string]::IsNullOrWhiteSpace($profileId) -or
+            $null -eq $Profiles -or
+            $null -eq $Profiles.PSObject.Properties[$profileId]) {
+            Write-Output ([pscustomobject]@{
+                code = 'PROFILE_NOT_FOUND'
+                path = $routePath + '.profile'
+                message = 'Route references an unknown profile.'
+            })
+        }
+        $defaultModeProperty = $route.PSObject.Properties['defaultMode']
+        if ($null -ne $defaultModeProperty -and [string]$defaultModeProperty.Value -ne 'read') {
+            Write-Output ([pscustomobject]@{
+                code = 'ROUTE_DEFAULT_WRITE_FORBIDDEN'
+                path = $routePath + '.defaultMode'
+                message = 'Routes can only default to read mode.'
+            })
+        }
+        $capabilitiesProperty = $route.PSObject.Properties['requiredCapabilities']
+        if ($null -ne $capabilitiesProperty) {
+            $capabilities = @($capabilitiesProperty.Value)
+            for ($index = 0; $index -lt $capabilities.Count; $index++) {
+                if ($knownCapabilities -notcontains [string]$capabilities[$index]) {
+                    Write-Output ([pscustomobject]@{
+                        code = 'CAPABILITY_UNKNOWN'
+                        path = ('{0}.requiredCapabilities[{1}]' -f $routePath, $index)
+                        message = 'Route capability is not recognized.'
+                    })
+                }
+            }
+        }
+    }
+}
+
+function Resolve-AiwWorkerExecutablePath {
+    param(
+        [Parameter(Mandatory)][object]$Worker,
+        [Parameter(Mandatory)][object]$Adapter,
+        [Parameter(Mandatory)][string]$ConfigDirectory
+    )
+
+    $pathProperty = $Worker.PSObject.Properties['path']
+    $configuredPath = if ($null -eq $pathProperty) { $null } else { [string]$pathProperty.Value }
+    if (-not [string]::IsNullOrWhiteSpace($configuredPath)) {
+        $expanded = [Environment]::ExpandEnvironmentVariables($configuredPath)
+        if (-not [System.IO.Path]::IsPathRooted($expanded)) {
+            $expanded = Join-Path $ConfigDirectory $expanded
+        }
+        $resolved = [System.IO.Path]::GetFullPath($expanded)
+    } else {
+        $commandName = switch ($Adapter.id) {
+            'claude-code/v1' { 'claude' }
+            'antigravity/v1' { 'agy' }
+            'minimax-cli/v1' { 'mmx' }
+        }
+        $command = Get-Command $commandName -ErrorAction SilentlyContinue | Select-Object -First 1
+        $resolved = if ($null -eq $command) { $null } else { [string]$command.Source }
+    }
+    if ([string]::IsNullOrWhiteSpace($resolved) -or
+        -not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw 'Configured worker executable was not found.'
+    }
+    $resolved = (Resolve-Path -LiteralPath $resolved).Path
+    $leaf = [System.IO.Path]::GetFileName($resolved).ToLowerInvariant()
+    $allowedLeafNames = switch ($Adapter.id) {
+        'claude-code/v1' { @('claude.exe', 'claude.ps1') }
+        'antigravity/v1' { @('agy.exe', 'agy.ps1') }
+        'minimax-cli/v1' { @('mmx.exe', 'mmx.ps1', 'mmx.cmd') }
+    }
+    if ($allowedLeafNames -notcontains $leaf) {
+        throw 'Configured executable filename is not allowed for the adapter.'
+    }
+    return $resolved
+}
+
+function New-AiwRunPreflightFailure {
+    param(
+        [Parameter(Mandatory)][object]$Request,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$FailureKind,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    return [pscustomobject]@{
+        schemaVersion = 2
+        ok = $false
+        command = 'run'
+        request = [pscustomobject]@{
+            worker = $Request.worker
+            profile = $Request.profile
+            route = $Request.route
+            mode = $Request.mode
+            requiredCapabilities = @($Request.requiredCapabilities)
+        }
+        selection = $null
+        exitCode = 2
+        timedOut = $false
+        readTimedOut = $false
+        terminationSucceeded = $false
+        durationMs = 0
+        failureKind = $FailureKind
+        skipped = @()
+        attempts = @()
+        output = ''
+        error = [pscustomobject]@{
+            code = $Code
+            phase = 'preflight'
+            message = $Message
+        }
+        errors = @()
+        diagnostics = $null
+        warnings = @()
+    }
+}
+
+function New-AiwRunPlan {
+    param([Parameter(Mandatory)][object]$Request)
+
+    $validation = New-AiwConfigValidationResult -Path ([string]$Request.configPath)
+    if (-not $validation.ok) {
+        return [pscustomobject]@{
+            schemaVersion = 2
+            ok = $false
+            command = 'run'
+            request = [pscustomobject]@{
+                worker = $Request.worker
+                profile = $Request.profile
+                route = $Request.route
+                mode = $Request.mode
+                requiredCapabilities = @($Request.requiredCapabilities)
+            }
+            selection = $null
+            exitCode = 2
+            timedOut = $false
+            readTimedOut = $false
+            terminationSucceeded = $false
+            durationMs = 0
+            failureKind = 'config_invalid'
+            skipped = @()
+            attempts = @()
+            output = ''
+            error = [pscustomobject]@{
+                code = 'CONFIG_INVALID'
+                phase = 'preflight'
+                message = 'Configuration validation failed.'
+            }
+            errors = @($validation.errors)
+            diagnostics = $null
+            warnings = @()
+        }
+    }
+
+    $selectorCount = @($Request.worker, $Request.profile, $Request.route |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+    if ($selectorCount -ne 1 -or [string]::IsNullOrWhiteSpace([string]$Request.worker)) {
+        throw 'The first run tracer requires exactly one -Worker selector.'
+    }
+
+    $loaded = Read-AiwConfigDocument -Path ([string]$Request.configPath)
+    $workerProperty = $loaded.document.workers.PSObject.Properties[[string]$Request.worker]
+    if ($null -eq $workerProperty) {
+        throw 'Selected worker was not found.'
+    }
+    $worker = $workerProperty.Value
+    $enabledProperty = $worker.PSObject.Properties['enabled']
+    if ($null -ne $enabledProperty -and $enabledProperty.Value -eq $false) {
+        throw 'Selected worker is disabled.'
+    }
+    $adapter = Get-AiwAdapterDescriptor -Id ([string]$worker.adapter)
+    $configuredCapabilitiesProperty = $worker.PSObject.Properties['capabilities']
+    $effectiveCapabilities = if ($null -eq $configuredCapabilitiesProperty -or
+        $null -eq $configuredCapabilitiesProperty.Value) {
+        @($adapter.capabilities)
+    } else {
+        @($configuredCapabilitiesProperty.Value)
+    }
+    $requiredCapabilities = @('text.reason') + @($Request.requiredCapabilities)
+    if ([string]$Request.mode -eq 'write') {
+        $requiredCapabilities += 'workspace.write'
+    }
+    foreach ($capability in @($requiredCapabilities | Select-Object -Unique)) {
+        if ($effectiveCapabilities -notcontains $capability) {
+            return New-AiwRunPreflightFailure `
+                -Request $Request `
+                -Code 'CAPABILITY_DENIED' `
+                -FailureKind 'capability_denied' `
+                -Message 'Selected worker does not provide all required capabilities.'
+        }
+    }
+
+    $configDirectory = Split-Path -Parent $loaded.path
+    $filePath = Resolve-AiwWorkerExecutablePath -Worker $worker -Adapter $adapter -ConfigDirectory $configDirectory
+    $modelProperty = $worker.PSObject.Properties['model']
+    $model = if ($null -eq $modelProperty) { $null } else { [string]$modelProperty.Value }
+    if ($adapter.id -ne 'claude-code/v1') {
+        throw 'The first run tracer currently supports the claude-code/v1 adapter.'
+    }
+    if ([string]::IsNullOrWhiteSpace($model)) {
+        throw 'Claude Code workers require a pinned model in v0.3 config.'
+    }
+    $permissionMode = if ([string]$Request.mode -eq 'write') { 'acceptEdits' } else { 'plan' }
+    $tools = if ([string]$Request.mode -eq 'write') {
+        'Read,Glob,Grep,Edit,Write,Bash'
+    } else {
+        'Read,Glob,Grep'
+    }
+    $arguments = @(
+        '-p', 'Read the complete work order from standard input. Follow it only within the declared tool and permission constraints.',
+        '--model', $model,
+        '--permission-mode', $permissionMode,
+        '--tools', $tools,
+        '--no-session-persistence',
+        '--output-format', 'json',
+        '--max-turns', '20'
+    )
+
+    return [pscustomobject]@{
+        schemaVersion = 2
+        ok = $true
+        command = 'run.plan'
+        exitCode = 0
+        request = [pscustomobject]@{
+            worker = [string]$Request.worker
+            profile = $null
+            route = $null
+            mode = [string]$Request.mode
+            requiredCapabilities = @($requiredCapabilities | Select-Object -Unique)
+        }
+        selection = [pscustomobject]@{
+            resolvedProfile = $null
+            worker = [string]$Request.worker
+            adapter = $adapter.id
+            model = $model
+        }
+        plan = [pscustomobject]@{
+            filePath = $filePath
+            arguments = $arguments
+            workingDirectory = [string]$Request.workingDirectory
+            standardInputText = [string]$Request.promptText
+            environmentOverlay = [pscustomobject]@{}
+            allowBatchWorker = $false
+        }
+        error = $null
+        diagnostics = $null
+        warnings = @()
+    }
+}
+
 function New-AiwConfigValidationResult {
     param(
         [Parameter(Mandatory)]
@@ -185,6 +663,15 @@ function New-AiwConfigValidationResult {
             message = 'Configuration field is not supported.'
         }
     }
+    $workersProperty = $loaded.document.PSObject.Properties['workers']
+    $workersValue = if ($null -eq $workersProperty) { $null } else { $workersProperty.Value }
+    $errors += @(Get-AiwWorkerValidationErrors -Workers $workersValue)
+    $profilesProperty = $loaded.document.PSObject.Properties['profiles']
+    $profilesValue = if ($null -eq $profilesProperty) { $null } else { $profilesProperty.Value }
+    $errors += @(Get-AiwProfileValidationErrors -Profiles $profilesValue -Workers $workersValue)
+    $routesProperty = $loaded.document.PSObject.Properties['routes']
+    $routesValue = if ($null -eq $routesProperty) { $null } else { $routesProperty.Value }
+    $errors += @(Get-AiwRouteValidationErrors -Routes $routesValue -Profiles $profilesValue)
 
     if ($errors.Count -gt 0) {
         return [pscustomobject]@{
@@ -256,6 +743,9 @@ function Invoke-AiwCore {
                 throw 'Core config request is missing configPath.'
             }
             return New-AiwConfigValidationResult -Path ([string]$pathProperty.Value)
+        }
+        'run.plan' {
+            return New-AiwRunPlan -Request $Request
         }
         default {
             throw ('Unsupported core command: {0}' -f $commandProperty.Value)
