@@ -977,6 +977,86 @@ try {
         Assert-True -Condition (-not (Test-Path -LiteralPath $miniMaxMarker)) -Message 'Capability-ineligible worker process was started'
     }
 
+    Invoke-Test -Name 'Run invokes a named MiniMax worker through an ephemeral UTF-8 message file' -Body {
+        $workerPath = Join-Path $tempRoot 'mmx.ps1'
+        $configPath = Join-Path $tempRoot 'run-minimax-v2.json'
+        $promptPath = Join-Path $tempRoot 'run-minimax-prompt.md'
+        $expectedPrompt = 'MiniMax UTF-8 ' + [string][char]0x5DE5 + [string][char]0x4F5C + [string][char]0x5355
+        $fixtureScript = @'
+$messagesIndex = [Array]::IndexOf([object[]]$args, '--messages-file')
+$baseUrlIndex = [Array]::IndexOf([object[]]$args, '--base-url')
+if ($messagesIndex -lt 0 -or $baseUrlIndex -lt 0) { exit 41 }
+$messagesPath = [string]$args[$messagesIndex + 1]
+$messages = Get-Content -LiteralPath $messagesPath -Raw -Encoding UTF8 | ConvertFrom-Json
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$result = [pscustomobject]@{
+    prompt = [string]$messages[0].content
+    messagesFile = $messagesPath
+    argumentBaseUrl = [string]$args[$baseUrlIndex + 1]
+    environmentBaseUrl = [string]$env:MINIMAX_BASE_URL
+}
+[Console]::Write(($result | ConvertTo-Json -Compress))
+'@
+        [System.IO.File]::WriteAllText(
+            $workerPath,
+            $fixtureScript,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        [System.IO.File]::WriteAllText(
+            $promptPath,
+            $expectedPrompt,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $runConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                'minimax-fixture' = [ordered]@{
+                    adapter = 'minimax-cli/v1'
+                    enabled = $true
+                    path = $workerPath
+                    model = 'fixture-model'
+                    capabilities = @('text.reason')
+                    settings = [ordered]@{ region = 'cn' }
+                }
+            }
+            profiles = [ordered]@{}
+            routes = [ordered]@{}
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $runConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $runOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            run `
+            -Worker 'minimax-fixture' `
+            -PromptFile $promptPath `
+            -Mode read `
+            -WorkingDirectory $tempRoot `
+            -ConfigPath $configPath `
+            -TimeoutSeconds 30 `
+            -Json
+        $runExitCode = $LASTEXITCODE
+        $run = (@($runOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+        Assert-Equal -Expected 0 -Actual $runExitCode -Message 'Named MiniMax run returned a non-zero exit code'
+        Assert-True -Condition $run.ok -Message 'Named MiniMax run failed'
+        Assert-Equal -Expected 'minimax-cli/v1' -Actual $run.selection.adapter -Message 'MiniMax run selected the wrong adapter'
+        Assert-Equal -Expected $expectedPrompt -Actual $run.output.prompt -Message 'MiniMax run changed the UTF-8 work order'
+        Assert-Equal -Expected 'https://api.minimaxi.com' -Actual $run.output.argumentBaseUrl -Message 'MiniMax CN region argument endpoint changed'
+        Assert-Equal -Expected 'https://api.minimaxi.com' -Actual $run.output.environmentBaseUrl -Message 'MiniMax CN region environment endpoint changed'
+        Assert-True -Condition (-not (Test-Path -LiteralPath (Split-Path -Parent $run.output.messagesFile))) -Message 'MiniMax ephemeral message directory was not removed'
+    }
+
     Write-Output ('All {0} tests passed.' -f $script:Passed)
 } finally {
     $resolvedTempBase = (Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())).Path

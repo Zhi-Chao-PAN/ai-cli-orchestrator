@@ -1160,6 +1160,12 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
         $coreResult = Invoke-AiwCore -Request $coreRequest
         if ($Command -eq 'run' -and $coreResult.ok) {
             $environmentPreviousValues = @{}
+            $temporaryDirectoryProperty = $coreResult.plan.PSObject.Properties['temporaryDirectory']
+            $temporaryDirectory = if ($null -eq $temporaryDirectoryProperty) {
+                $null
+            } else {
+                [string]$temporaryDirectoryProperty.Value
+            }
             try {
                 foreach ($property in $coreResult.plan.environmentOverlay.PSObject.Properties) {
                     $environmentPreviousValues[$property.Name] = [Environment]::GetEnvironmentVariable($property.Name)
@@ -1175,6 +1181,9 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
             } finally {
                 foreach ($name in $environmentPreviousValues.Keys) {
                     Restore-EnvironmentVariable -Name $name -PreviousValue $environmentPreviousValues[$name]
+                }
+                if (-not [string]::IsNullOrWhiteSpace($temporaryDirectory)) {
+                    Remove-AiwTemporaryDirectory -Path $temporaryDirectory
                 }
             }
 

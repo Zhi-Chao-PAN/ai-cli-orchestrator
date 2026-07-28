@@ -154,6 +154,37 @@ function Get-AiwAdapterDescriptor {
     return @(Get-AiwAdapterCatalog | Where-Object { $_.id -eq $Id } | Select-Object -First 1)[0]
 }
 
+function New-AiwMiniMaxMessageArtifact {
+    param([Parameter(Mandatory)][string]$PromptText)
+
+    $directory = Join-Path ([System.IO.Path]::GetTempPath()) ('aiw-minimax-{0}' -f [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $directory -ErrorAction Stop)
+    $path = Join-Path $directory 'messages.json'
+    try {
+        $messages = @(
+            [pscustomobject]@{
+                role = 'user'
+                content = $PromptText
+            }
+        )
+        $json = ConvertTo-Json -InputObject $messages -Depth 5 -Compress
+        [System.IO.File]::WriteAllText(
+            $path,
+            $json,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+    } catch {
+        if (Test-Path -LiteralPath $directory -PathType Container) {
+            Remove-Item -LiteralPath $directory -Recurse -Force
+        }
+        throw
+    }
+    return [pscustomobject]@{
+        directory = $directory
+        path = $path
+    }
+}
+
 function Get-AiwWorkerValidationErrors {
     param(
         [AllowNull()]
@@ -687,27 +718,69 @@ function New-AiwRunPlan {
 
     $modelProperty = $worker.PSObject.Properties['model']
     $model = if ($null -eq $modelProperty) { $null } else { [string]$modelProperty.Value }
-    if ($adapter.id -ne 'claude-code/v1') {
-        throw 'The first run tracer currently supports the claude-code/v1 adapter.'
-    }
     if ([string]::IsNullOrWhiteSpace($model)) {
-        throw 'Claude Code workers require a pinned model in v0.3 config.'
+        throw ('{0} workers require a pinned model in explicit v0.3 configuration.' -f $adapter.id)
     }
-    $permissionMode = if ([string]$Request.mode -eq 'write') { 'acceptEdits' } else { 'plan' }
-    $tools = if ([string]$Request.mode -eq 'write') {
-        'Read,Glob,Grep,Edit,Write,Bash'
-    } else {
-        'Read,Glob,Grep'
+
+    $arguments = @()
+    $standardInputText = $null
+    $environmentOverlay = [pscustomobject]@{}
+    $allowBatchWorker = $false
+    $temporaryDirectory = $null
+    switch ($adapter.id) {
+        'claude-code/v1' {
+            $permissionMode = if ([string]$Request.mode -eq 'write') { 'acceptEdits' } else { 'plan' }
+            $tools = if ([string]$Request.mode -eq 'write') {
+                'Read,Glob,Grep,Edit,Write,Bash'
+            } else {
+                'Read,Glob,Grep'
+            }
+            $arguments = @(
+                '-p', 'Read the complete work order from standard input. Follow it only within the declared tool and permission constraints.',
+                '--model', $model,
+                '--permission-mode', $permissionMode,
+                '--tools', $tools,
+                '--no-session-persistence',
+                '--output-format', 'json',
+                '--max-turns', '20'
+            )
+            $standardInputText = [string]$Request.promptText
+        }
+        'minimax-cli/v1' {
+            $settingsProperty = $worker.PSObject.Properties['settings']
+            $settings = if ($null -eq $settingsProperty) { $null } else { $settingsProperty.Value }
+            $regionProperty = if ($null -eq $settings) { $null } else { $settings.PSObject.Properties['region'] }
+            $region = if ($null -eq $regionProperty) { $null } else { [string]$regionProperty.Value }
+            $baseUrl = switch ($region) {
+                'cn' { 'https://api.minimaxi.com' }
+                'global' { 'https://api.minimax.io' }
+                default { throw 'MiniMax workers require a reviewed region value.' }
+            }
+            $artifact = New-AiwMiniMaxMessageArtifact -PromptText ([string]$Request.promptText)
+            $temporaryDirectory = $artifact.directory
+            $arguments = @(
+                '--base-url', $baseUrl,
+                '--output', 'json',
+                '--non-interactive',
+                '--no-color',
+                '--timeout', [string]$Request.timeoutSeconds,
+                'text', 'chat',
+                '--model', $model,
+                '--messages-file', $artifact.path,
+                '--max-tokens', '4096'
+            )
+            $environmentOverlay = [pscustomobject]@{
+                MINIMAX_BASE_URL = $baseUrl
+            }
+            $allowBatchWorker = [System.IO.Path]::GetExtension($filePath).Equals(
+                '.cmd',
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        }
+        default {
+            throw ('Adapter execution is not implemented: {0}' -f $adapter.id)
+        }
     }
-    $arguments = @(
-        '-p', 'Read the complete work order from standard input. Follow it only within the declared tool and permission constraints.',
-        '--model', $model,
-        '--permission-mode', $permissionMode,
-        '--tools', $tools,
-        '--no-session-persistence',
-        '--output-format', 'json',
-        '--max-turns', '20'
-    )
 
     return [pscustomobject]@{
         schemaVersion = 2
@@ -731,9 +804,10 @@ function New-AiwRunPlan {
             filePath = $filePath
             arguments = $arguments
             workingDirectory = [string]$Request.workingDirectory
-            standardInputText = [string]$Request.promptText
-            environmentOverlay = [pscustomobject]@{}
-            allowBatchWorker = $false
+            standardInputText = $standardInputText
+            environmentOverlay = $environmentOverlay
+            allowBatchWorker = $allowBatchWorker
+            temporaryDirectory = $temporaryDirectory
         }
         skipped = @($skipped)
         error = $null
