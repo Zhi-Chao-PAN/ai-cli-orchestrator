@@ -504,6 +504,94 @@ try {
         Assert-True -Condition (-not $validationText.Contains($secretSentinel)) -Message 'Rejected config value leaked into JSON output'
     }
 
+    Invoke-Test -Name 'Config validate rejects executable fields at nested paths' -Body {
+        $configPath = Join-Path $tempRoot 'nested-command-v2.json'
+        $nestedConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                review = [ordered]@{
+                    adapter = 'antigravity/v1'
+                    settings = [ordered]@{
+                        command = 'nested-command-value'
+                    }
+                }
+            }
+            profiles = [ordered]@{}
+            routes = [ordered]@{}
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $nestedConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $validationOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            config `
+            -Action validate `
+            -ConfigPath $configPath `
+            -Json
+        $validationExitCode = $LASTEXITCODE
+        $validation = (@($validationOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+        Assert-Equal -Expected 2 -Actual $validationExitCode -Message 'Nested executable field returned the wrong exit code'
+        Assert-Equal -Expected 'FIELD_FORBIDDEN' -Actual $validation.errors[0].code -Message 'Nested executable field error code changed'
+        Assert-Equal -Expected '$.workers.review.settings.command' -Actual $validation.errors[0].path -Message 'Nested executable field path changed'
+    }
+
+    Invoke-Test -Name 'Config validate rejects secret-like fields without echoing names or values' -Body {
+        $configPath = Join-Path $tempRoot 'secret-field-v2.json'
+        $secretSentinel = 'CONFIG_SECRET_VALUE_SENTINEL'
+        $secretConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                review = [ordered]@{
+                    adapter = 'antigravity/v1'
+                    settings = [ordered]@{
+                        apiKey = $secretSentinel
+                    }
+                }
+            }
+            profiles = [ordered]@{}
+            routes = [ordered]@{}
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $secretConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $validationOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            config `
+            -Action validate `
+            -ConfigPath $configPath `
+            -Json
+        $validationExitCode = $LASTEXITCODE
+        $validationText = @($validationOutput) -join [Environment]::NewLine
+        $validation = $validationText | ConvertFrom-Json
+
+        Assert-Equal -Expected 2 -Actual $validationExitCode -Message 'Secret-like field returned the wrong exit code'
+        Assert-Equal -Expected 'FIELD_SECRET_FORBIDDEN' -Actual $validation.errors[0].code -Message 'Secret-like field error code changed'
+        Assert-Equal -Expected '$.workers.review.settings.<redacted>' -Actual $validation.errors[0].path -Message 'Secret-like field path was not redacted'
+        Assert-True -Condition (-not $validationText.Contains('apiKey')) -Message 'Secret-like field name leaked into JSON output'
+        Assert-True -Condition (-not $validationText.Contains($secretSentinel)) -Message 'Secret-like field value leaked into JSON output'
+    }
+
     Write-Output ('All {0} tests passed.' -f $script:Passed)
 } finally {
     $resolvedTempBase = (Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())).Path

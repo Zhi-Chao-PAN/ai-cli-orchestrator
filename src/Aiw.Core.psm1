@@ -64,6 +64,90 @@ function Read-AiwConfigDocument {
     }
 }
 
+function Get-AiwUnsafeFieldErrors {
+    param(
+        [AllowNull()]
+        [object]$Value,
+
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [int]$Depth = 0
+    )
+
+    if ($Depth -gt 20) {
+        Write-Output ([pscustomobject]@{
+            code = 'CONFIG_LIMIT_EXCEEDED'
+            path = $Path
+            message = 'Configuration nesting exceeds the supported limit.'
+        })
+        return
+    }
+    if ($null -eq $Value) {
+        return
+    }
+    if ($Value -is [System.Array]) {
+        for ($index = 0; $index -lt $Value.Count; $index++) {
+            Get-AiwUnsafeFieldErrors -Value $Value[$index] -Path ('{0}[{1}]' -f $Path, $index) -Depth ($Depth + 1)
+        }
+        return
+    }
+    if ($Value -isnot [pscustomobject]) {
+        return
+    }
+
+    $forbiddenFieldNames = @(
+        'command',
+        'args',
+        'arguments',
+        'template',
+        'script',
+        'shell',
+        'hook',
+        'env'
+    )
+    $secretFieldNames = @(
+        'key',
+        'apikey',
+        'accesskey',
+        'secretkey',
+        'token',
+        'accesstoken',
+        'authtoken',
+        'refreshtoken',
+        'sessiontoken',
+        'clientsecret',
+        'password',
+        'credential',
+        'credentials',
+        'authorization',
+        'cookie',
+        'setcookie',
+        'bearer'
+    )
+    foreach ($property in $Value.PSObject.Properties) {
+        $propertyPath = $Path + '.' + $property.Name
+        $normalizedName = ($property.Name -replace '[-_]', '').ToLowerInvariant()
+        if ($secretFieldNames -contains $normalizedName) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_SECRET_FORBIDDEN'
+                path = $Path + '.<redacted>'
+                message = 'Credential fields are forbidden in AIW configuration.'
+            })
+            continue
+        }
+        if ($forbiddenFieldNames -contains $property.Name.ToLowerInvariant()) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_FORBIDDEN'
+                path = $propertyPath
+                message = 'Executable configuration fields are forbidden.'
+            })
+            continue
+        }
+        Get-AiwUnsafeFieldErrors -Value $property.Value -Path $propertyPath -Depth ($Depth + 1)
+    }
+}
+
 function New-AiwConfigValidationResult {
     param(
         [Parameter(Mandatory)]
@@ -86,34 +170,19 @@ function New-AiwConfigValidationResult {
         'profiles',
         'routes'
     )
-    $forbiddenFieldNames = @(
-        'command',
-        'args',
-        'arguments',
-        'template',
-        'script',
-        'shell',
-        'hook',
-        'env'
-    )
-    $errors = @()
+    $errors = @(Get-AiwUnsafeFieldErrors -Value $loaded.document -Path '$')
     foreach ($property in $loaded.document.PSObject.Properties) {
         if ($allowedTopLevelFields -contains $property.Name) {
             continue
         }
-        $code = if ($forbiddenFieldNames -contains $property.Name.ToLowerInvariant()) {
-            'FIELD_FORBIDDEN'
-        } else {
-            'FIELD_UNKNOWN'
+        if (@('command', 'args', 'arguments', 'template', 'script', 'shell', 'hook', 'env') -contains
+            $property.Name.ToLowerInvariant()) {
+            continue
         }
         $errors += [pscustomobject]@{
-            code = $code
+            code = 'FIELD_UNKNOWN'
             path = '$.' + $property.Name
-            message = if ($code -eq 'FIELD_FORBIDDEN') {
-                'Executable configuration fields are forbidden.'
-            } else {
-                'Configuration field is not supported.'
-            }
+            message = 'Configuration field is not supported.'
         }
     }
 
