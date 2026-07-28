@@ -265,6 +265,30 @@ function New-AiwMiniMaxMessageArtifact {
     }
 }
 
+function New-AiwAntigravityWorkOrderArtifact {
+    param([Parameter(Mandatory)][string]$PromptText)
+
+    $directory = Join-Path ([System.IO.Path]::GetTempPath()) ('aiw-google-{0}' -f [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $directory -ErrorAction Stop)
+    $path = Join-Path $directory 'work-order.md'
+    try {
+        [System.IO.File]::WriteAllText(
+            $path,
+            $PromptText,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+    } catch {
+        if (Test-Path -LiteralPath $directory -PathType Container) {
+            Remove-Item -LiteralPath $directory -Recurse -Force
+        }
+        throw
+    }
+    return [pscustomobject]@{
+        directory = $directory
+        path = $path
+    }
+}
+
 function Get-AiwWorkerValidationErrors {
     param(
         [AllowNull()]
@@ -862,6 +886,20 @@ function New-AiwRunPlan {
                 '--max-turns', '20'
             )
             $standardInputText = [string]$Request.promptText
+        }
+        'antigravity/v1' {
+            $artifact = New-AiwAntigravityWorkOrderArtifact -PromptText ([string]$Request.promptText)
+            $temporaryDirectory = $artifact.directory
+            $arguments = @(
+                '--print', ('Read and follow the complete work order in {0}.' -f $artifact.path),
+                '--model', $model,
+                '--mode', $(if ([string]$Request.mode -eq 'write') { 'accept-edits' } else { 'plan' }),
+                '--print-timeout', ('{0}s' -f [string]$Request.timeoutSeconds),
+                '--add-dir', [string]$Request.workingDirectory,
+                '--add-dir', $artifact.directory,
+                '--sandbox',
+                '--output-format', 'text'
+            )
         }
         'minimax-cli/v1' {
             $settingsProperty = $worker.PSObject.Properties['settings']

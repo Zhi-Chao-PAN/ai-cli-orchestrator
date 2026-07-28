@@ -1220,6 +1220,109 @@ $result = [pscustomobject]@{
         Assert-True -Condition (-not (Test-Path -LiteralPath (Split-Path -Parent $run.output.messagesFile))) -Message 'MiniMax ephemeral message directory was not removed'
     }
 
+    Invoke-Test -Name 'Run invokes a named Antigravity worker with sandboxed workspace scoping' -Body {
+        $workerPath = Join-Path $tempRoot 'agy.ps1'
+        $configPath = Join-Path $tempRoot 'run-antigravity-v2.json'
+        $promptPath = Join-Path $tempRoot 'run-antigravity-prompt.md'
+        $expectedPrompt = 'Antigravity UTF-8 ' + [string][char]0x5BA1 + [string][char]0x67E5
+        $fixtureScript = @'
+$printIndex = [Array]::IndexOf([object[]]$args, '--print')
+$modelIndex = [Array]::IndexOf([object[]]$args, '--model')
+$modeIndex = [Array]::IndexOf([object[]]$args, '--mode')
+$timeoutIndex = [Array]::IndexOf([object[]]$args, '--print-timeout')
+$addDirectories = @()
+for ($index = 0; $index -lt $args.Count; $index++) {
+    if ([string]$args[$index] -eq '--add-dir') {
+        $addDirectories += [string]$args[$index + 1]
+    }
+}
+if ($printIndex -lt 0 -or $addDirectories.Count -ne 2) { exit 42 }
+$workOrderDirectory = $addDirectories[1]
+$workOrderPath = Join-Path $workOrderDirectory 'work-order.md'
+$result = [pscustomobject]@{
+    prompt = [System.IO.File]::ReadAllText($workOrderPath, (New-Object System.Text.UTF8Encoding($false, $true)))
+    workOrderFile = $workOrderPath
+    printInstruction = [string]$args[$printIndex + 1]
+    model = [string]$args[$modelIndex + 1]
+    mode = [string]$args[$modeIndex + 1]
+    timeout = [string]$args[$timeoutIndex + 1]
+    sandbox = ([Array]::IndexOf([object[]]$args, '--sandbox') -ge 0)
+    outputFormat = [string]$args[[Array]::IndexOf([object[]]$args, '--output-format') + 1]
+    addDirectories = $addDirectories
+    workingDirectory = [Environment]::CurrentDirectory
+    argumentText = [string]::Join(' ', [string[]]$args)
+}
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::Write(($result | ConvertTo-Json -Depth 5 -Compress))
+'@
+        [System.IO.File]::WriteAllText(
+            $workerPath,
+            $fixtureScript,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        [System.IO.File]::WriteAllText(
+            $promptPath,
+            $expectedPrompt,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $runConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                'antigravity-fixture' = [ordered]@{
+                    adapter = 'antigravity/v1'
+                    enabled = $true
+                    path = $workerPath
+                    model = 'fixture-model'
+                    capabilities = @('text.reason', 'workspace.read')
+                    settings = [ordered]@{}
+                }
+            }
+            profiles = [ordered]@{}
+            routes = [ordered]@{}
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $runConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $runOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            run `
+            -Worker 'antigravity-fixture' `
+            -RequireCapability 'workspace.read' `
+            -PromptFile $promptPath `
+            -Mode read `
+            -WorkingDirectory $tempRoot `
+            -ConfigPath $configPath `
+            -TimeoutSeconds 30 `
+            -Json
+        $runExitCode = $LASTEXITCODE
+        $run = (@($runOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+        Assert-Equal -Expected 0 -Actual $runExitCode -Message 'Named Antigravity run returned a non-zero exit code'
+        Assert-True -Condition $run.ok -Message 'Named Antigravity run failed'
+        Assert-Equal -Expected 'antigravity/v1' -Actual $run.selection.adapter -Message 'Antigravity run selected the wrong adapter'
+        Assert-Equal -Expected $expectedPrompt -Actual $run.output.prompt -Message 'Antigravity run changed the UTF-8 work order'
+        Assert-Equal -Expected 'fixture-model' -Actual $run.output.model -Message 'Antigravity model argument changed'
+        Assert-Equal -Expected 'plan' -Actual $run.output.mode -Message 'Antigravity read mode was not bounded to plan'
+        Assert-Equal -Expected '30s' -Actual $run.output.timeout -Message 'Antigravity print timeout changed'
+        Assert-Equal -Expected 'text' -Actual $run.output.outputFormat -Message 'Antigravity output format changed'
+        Assert-True -Condition $run.output.sandbox -Message 'Antigravity sandbox flag was omitted'
+        Assert-Equal -Expected $tempRoot -Actual $run.output.addDirectories[0] -Message 'Antigravity canonical workspace registration changed'
+        Assert-Equal -Expected $tempRoot -Actual $run.output.workingDirectory -Message 'Antigravity process working directory changed'
+        Assert-True -Condition (-not $run.output.argumentText.Contains($expectedPrompt)) -Message 'Antigravity prompt leaked into process arguments'
+        Assert-True -Condition $run.output.printInstruction.Contains($run.output.workOrderFile) -Message 'Antigravity print instruction did not reference the controlled work order'
+        Assert-True -Condition (-not (Test-Path -LiteralPath (Split-Path -Parent $run.output.workOrderFile))) -Message 'Antigravity ephemeral work-order directory was not removed'
+    }
+
     Write-Output ('All {0} tests passed.' -f $script:Passed)
 } finally {
     $resolvedTempBase = (Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())).Path
