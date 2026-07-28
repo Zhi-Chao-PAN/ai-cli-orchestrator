@@ -818,6 +818,165 @@ try {
         Assert-True -Condition (-not (Test-Path -LiteralPath $markerPath)) -Message 'Capability-denied worker process was started'
     }
 
+    Invoke-Test -Name 'Run selects the first eligible worker from a profile' -Body {
+        $workerPath = Join-Path $tempRoot 'claude.ps1'
+        $configPath = Join-Path $tempRoot 'run-profile-v2.json'
+        $promptPath = Join-Path $tempRoot 'run-profile-prompt.md'
+        [System.IO.File]::WriteAllText(
+            $workerPath,
+            '[Console]::Write(''PROFILE_RUN_OK'')',
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        [System.IO.File]::WriteAllText($promptPath, 'profile task')
+        $runConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                disabled = [ordered]@{
+                    adapter = 'minimax-cli/v1'
+                    enabled = $false
+                    path = $null
+                    model = 'fixture-model'
+                    capabilities = @('text.reason')
+                    settings = [ordered]@{ region = 'cn' }
+                }
+                primary = [ordered]@{
+                    adapter = 'claude-code/v1'
+                    enabled = $true
+                    path = $workerPath
+                    model = 'fixture-model'
+                    capabilities = @('text.reason')
+                    settings = [ordered]@{}
+                }
+            }
+            profiles = [ordered]@{
+                reasoning = [ordered]@{
+                    workers = @('disabled', 'primary')
+                    fallback = [ordered]@{ maxAttempts = 1; on = @() }
+                }
+            }
+            routes = [ordered]@{}
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $runConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $runOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            run `
+            -Profile 'reasoning' `
+            -PromptFile $promptPath `
+            -Mode read `
+            -WorkingDirectory $tempRoot `
+            -ConfigPath $configPath `
+            -TimeoutSeconds 30 `
+            -Json
+        $runExitCode = $LASTEXITCODE
+        $run = (@($runOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+        Assert-Equal -Expected 0 -Actual $runExitCode -Message 'Profile run returned a non-zero exit code'
+        Assert-Equal -Expected 'primary' -Actual $run.selection.worker -Message 'Profile selected the wrong worker'
+        Assert-Equal -Expected 'reasoning' -Actual $run.selection.resolvedProfile -Message 'Resolved profile changed'
+        Assert-Equal -Expected 'PROFILE_RUN_OK' -Actual $run.output -Message 'Profile worker output changed'
+        Assert-Equal -Expected 1 -Actual @($run.skipped).Count -Message 'Profile static skip count changed'
+        Assert-Equal -Expected 'disabled' -Actual $run.skipped[0].worker -Message 'Profile skipped the wrong worker'
+        Assert-Equal -Expected 'disabled' -Actual $run.skipped[0].reason -Message 'Profile skip reason changed'
+    }
+
+    Invoke-Test -Name 'Run route capabilities take priority over worker order' -Body {
+        $miniMaxPath = Join-Path $tempRoot 'mmx.ps1'
+        $claudePath = Join-Path $tempRoot 'claude.ps1'
+        $miniMaxMarker = Join-Path $tempRoot 'route-minimax-started.marker'
+        $configPath = Join-Path $tempRoot 'run-route-v2.json'
+        $promptPath = Join-Path $tempRoot 'run-route-prompt.md'
+        [System.IO.File]::WriteAllText(
+            $miniMaxPath,
+            ('[System.IO.File]::WriteAllText(''{0}'', ''started'')' -f $miniMaxMarker.Replace("'", "''")),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        [System.IO.File]::WriteAllText(
+            $claudePath,
+            '[Console]::Write(''ROUTE_RUN_OK'')',
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        [System.IO.File]::WriteAllText($promptPath, 'repository review task')
+        $runConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                stateless = [ordered]@{
+                    adapter = 'minimax-cli/v1'
+                    enabled = $true
+                    path = $miniMaxPath
+                    model = 'fixture-model'
+                    capabilities = @('text.reason')
+                    settings = [ordered]@{ region = 'cn' }
+                }
+                repository = [ordered]@{
+                    adapter = 'claude-code/v1'
+                    enabled = $true
+                    path = $claudePath
+                    model = 'fixture-model'
+                    capabilities = @('text.reason', 'workspace.read')
+                    settings = [ordered]@{}
+                }
+            }
+            profiles = [ordered]@{
+                paid = [ordered]@{
+                    workers = @('stateless', 'repository')
+                    fallback = [ordered]@{ maxAttempts = 1; on = @() }
+                }
+            }
+            routes = [ordered]@{
+                'repo-review' = [ordered]@{
+                    profile = 'paid'
+                    requiredCapabilities = @('text.reason', 'workspace.read')
+                    defaultMode = 'read'
+                    allowedModes = @('read')
+                }
+            }
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $runConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $runOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            run `
+            -Route 'repo-review' `
+            -PromptFile $promptPath `
+            -Mode read `
+            -WorkingDirectory $tempRoot `
+            -ConfigPath $configPath `
+            -TimeoutSeconds 30 `
+            -Json
+        $runExitCode = $LASTEXITCODE
+        $run = (@($runOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+        Assert-Equal -Expected 0 -Actual $runExitCode -Message 'Route run returned a non-zero exit code'
+        Assert-Equal -Expected 'repository' -Actual $run.selection.worker -Message 'Route selected a capability-ineligible worker'
+        Assert-Equal -Expected 'paid' -Actual $run.selection.resolvedProfile -Message 'Route resolved the wrong profile'
+        Assert-Equal -Expected 'ROUTE_RUN_OK' -Actual $run.output -Message 'Route worker output changed'
+        Assert-Equal -Expected 'capability_denied' -Actual $run.skipped[0].reason -Message 'Route skip reason changed'
+        Assert-True -Condition (-not (Test-Path -LiteralPath $miniMaxMarker)) -Message 'Capability-ineligible worker process was started'
+    }
+
     Write-Output ('All {0} tests passed.' -f $script:Passed)
 } finally {
     $resolvedTempBase = (Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())).Path

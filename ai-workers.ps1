@@ -1200,7 +1200,7 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
                 terminationSucceeded = $nativeResult.TerminationSucceeded
                 durationMs = $nativeResult.DurationMs
                 failureKind = $failureKind
-                skipped = @()
+                skipped = @($coreResult.skipped)
                 attempts = @(
                     [pscustomobject]@{
                         worker = $coreResult.selection.worker

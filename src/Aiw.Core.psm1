@@ -458,7 +458,8 @@ function New-AiwRunPreflightFailure {
         [Parameter(Mandatory)][object]$Request,
         [Parameter(Mandatory)][string]$Code,
         [Parameter(Mandatory)][string]$FailureKind,
-        [Parameter(Mandatory)][string]$Message
+        [Parameter(Mandatory)][string]$Message,
+        [object[]]$Skipped = @()
     )
 
     return [pscustomobject]@{
@@ -479,7 +480,7 @@ function New-AiwRunPreflightFailure {
         terminationSucceeded = $false
         durationMs = 0
         failureKind = $FailureKind
-        skipped = @()
+        skipped = @($Skipped)
         attempts = @()
         output = ''
         error = [pscustomobject]@{
@@ -530,46 +531,160 @@ function New-AiwRunPlan {
         }
     }
 
-    $selectorCount = @($Request.worker, $Request.profile, $Request.route |
-        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
-    if ($selectorCount -ne 1 -or [string]::IsNullOrWhiteSpace([string]$Request.worker)) {
-        throw 'The first run tracer requires exactly one -Worker selector.'
+    $loaded = Read-AiwConfigDocument -Path ([string]$Request.configPath)
+    $selectorValues = @(
+        @($Request.worker, $Request.profile, $Request.route) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    )
+    if ($selectorValues.Count -gt 1) {
+        return New-AiwRunPreflightFailure `
+            -Request $Request `
+            -Code 'SELECTION_REQUIRED' `
+            -FailureKind 'invalid_request' `
+            -Message 'Worker, profile, and route selectors are mutually exclusive.'
     }
 
-    $loaded = Read-AiwConfigDocument -Path ([string]$Request.configPath)
-    $workerProperty = $loaded.document.workers.PSObject.Properties[[string]$Request.worker]
-    if ($null -eq $workerProperty) {
-        throw 'Selected worker was not found.'
-    }
-    $worker = $workerProperty.Value
-    $enabledProperty = $worker.PSObject.Properties['enabled']
-    if ($null -ne $enabledProperty -and $enabledProperty.Value -eq $false) {
-        throw 'Selected worker is disabled.'
-    }
-    $adapter = Get-AiwAdapterDescriptor -Id ([string]$worker.adapter)
-    $configuredCapabilitiesProperty = $worker.PSObject.Properties['capabilities']
-    $effectiveCapabilities = if ($null -eq $configuredCapabilitiesProperty -or
-        $null -eq $configuredCapabilitiesProperty.Value) {
-        @($adapter.capabilities)
-    } else {
-        @($configuredCapabilitiesProperty.Value)
-    }
-    $requiredCapabilities = @('text.reason') + @($Request.requiredCapabilities)
-    if ([string]$Request.mode -eq 'write') {
-        $requiredCapabilities += 'workspace.write'
-    }
-    foreach ($capability in @($requiredCapabilities | Select-Object -Unique)) {
-        if ($effectiveCapabilities -notcontains $capability) {
+    $selectedWorkerId = [string]$Request.worker
+    $selectedProfileId = [string]$Request.profile
+    $selectedRouteId = [string]$Request.route
+    if ($selectorValues.Count -eq 0) {
+        $defaultRouteProperty = $loaded.document.PSObject.Properties['defaultRoute']
+        $defaultProfileProperty = $loaded.document.PSObject.Properties['defaultProfile']
+        if ($null -ne $defaultRouteProperty -and
+            -not [string]::IsNullOrWhiteSpace([string]$defaultRouteProperty.Value)) {
+            $selectedRouteId = [string]$defaultRouteProperty.Value
+        } elseif ($null -ne $defaultProfileProperty -and
+            -not [string]::IsNullOrWhiteSpace([string]$defaultProfileProperty.Value)) {
+            $selectedProfileId = [string]$defaultProfileProperty.Value
+        } else {
             return New-AiwRunPreflightFailure `
                 -Request $Request `
-                -Code 'CAPABILITY_DENIED' `
-                -FailureKind 'capability_denied' `
-                -Message 'Selected worker does not provide all required capabilities.'
+                -Code 'SELECTION_REQUIRED' `
+                -FailureKind 'selection_required' `
+                -Message 'Specify a worker, profile, or route.'
         }
     }
 
-    $configDirectory = Split-Path -Parent $loaded.path
-    $filePath = Resolve-AiwWorkerExecutablePath -Worker $worker -Adapter $adapter -ConfigDirectory $configDirectory
+    $routeCapabilities = @()
+    if (-not [string]::IsNullOrWhiteSpace($selectedRouteId)) {
+        $routeProperty = $loaded.document.routes.PSObject.Properties[$selectedRouteId]
+        if ($null -eq $routeProperty) {
+            return New-AiwRunPreflightFailure `
+                -Request $Request `
+                -Code 'ROUTE_NOT_FOUND' `
+                -FailureKind 'selection_required' `
+                -Message 'Selected route was not found.'
+        }
+        $routeDefinition = $routeProperty.Value
+        $selectedProfileId = [string]$routeDefinition.profile
+        $routeCapabilitiesProperty = $routeDefinition.PSObject.Properties['requiredCapabilities']
+        if ($null -ne $routeCapabilitiesProperty) {
+            $routeCapabilities = @($routeCapabilitiesProperty.Value)
+        }
+        $allowedModesProperty = $routeDefinition.PSObject.Properties['allowedModes']
+        $allowedModes = if ($null -eq $allowedModesProperty) { @('read') } else { @($allowedModesProperty.Value) }
+        if ($allowedModes -notcontains [string]$Request.mode) {
+            return New-AiwRunPreflightFailure `
+                -Request $Request `
+                -Code 'POLICY_DENIED' `
+                -FailureKind 'policy_denied' `
+                -Message 'Selected route does not allow the requested mode.'
+        }
+    }
+
+    $candidateWorkerIds = @()
+    if (-not [string]::IsNullOrWhiteSpace($selectedProfileId)) {
+        $profileProperty = $loaded.document.profiles.PSObject.Properties[$selectedProfileId]
+        if ($null -eq $profileProperty) {
+            return New-AiwRunPreflightFailure `
+                -Request $Request `
+                -Code 'PROFILE_NOT_FOUND' `
+                -FailureKind 'selection_required' `
+                -Message 'Selected profile was not found.'
+        }
+        $candidateWorkerIds = @($profileProperty.Value.workers)
+    } elseif (-not [string]::IsNullOrWhiteSpace($selectedWorkerId)) {
+        $candidateWorkerIds = @($selectedWorkerId)
+    }
+
+    $requiredCapabilities = @('text.reason') + @($Request.requiredCapabilities) + @($routeCapabilities)
+    if ([string]$Request.mode -eq 'write') {
+        $requiredCapabilities += 'workspace.write'
+    }
+    $requiredCapabilities = @($requiredCapabilities | Select-Object -Unique)
+    $skipped = @()
+    $worker = $null
+    $adapter = $null
+    $filePath = $null
+    foreach ($candidateWorkerId in $candidateWorkerIds) {
+        $workerProperty = $loaded.document.workers.PSObject.Properties[[string]$candidateWorkerId]
+        if ($null -eq $workerProperty) {
+            $skipped += [pscustomobject]@{ worker = [string]$candidateWorkerId; reason = 'not_found' }
+            continue
+        }
+        $candidateWorker = $workerProperty.Value
+        $enabledProperty = $candidateWorker.PSObject.Properties['enabled']
+        if ($null -ne $enabledProperty -and $enabledProperty.Value -eq $false) {
+            $skipped += [pscustomobject]@{ worker = [string]$candidateWorkerId; reason = 'disabled' }
+            continue
+        }
+        $candidateAdapter = Get-AiwAdapterDescriptor -Id ([string]$candidateWorker.adapter)
+        $configuredCapabilitiesProperty = $candidateWorker.PSObject.Properties['capabilities']
+        $effectiveCapabilities = if ($null -eq $configuredCapabilitiesProperty -or
+            $null -eq $configuredCapabilitiesProperty.Value) {
+            @($candidateAdapter.capabilities)
+        } else {
+            @($configuredCapabilitiesProperty.Value)
+        }
+        $missingCapability = $false
+        foreach ($capability in $requiredCapabilities) {
+            if ($effectiveCapabilities -notcontains $capability) {
+                $missingCapability = $true
+                break
+            }
+        }
+        if ($missingCapability) {
+            if (-not [string]::IsNullOrWhiteSpace($selectedWorkerId)) {
+                return New-AiwRunPreflightFailure `
+                    -Request $Request `
+                    -Code 'CAPABILITY_DENIED' `
+                    -FailureKind 'capability_denied' `
+                    -Message 'Selected worker does not provide all required capabilities.'
+            }
+            $skipped += [pscustomobject]@{ worker = [string]$candidateWorkerId; reason = 'capability_denied' }
+            continue
+        }
+        try {
+            $candidatePath = Resolve-AiwWorkerExecutablePath `
+                -Worker $candidateWorker `
+                -Adapter $candidateAdapter `
+                -ConfigDirectory (Split-Path -Parent $loaded.path)
+        } catch {
+            if (-not [string]::IsNullOrWhiteSpace($selectedWorkerId)) {
+                return New-AiwRunPreflightFailure `
+                    -Request $Request `
+                    -Code 'CLI_NOT_FOUND' `
+                    -FailureKind 'executable_not_found' `
+                    -Message 'Selected worker executable is unavailable.'
+            }
+            $skipped += [pscustomobject]@{ worker = [string]$candidateWorkerId; reason = 'executable_not_found' }
+            continue
+        }
+        $selectedWorkerId = [string]$candidateWorkerId
+        $worker = $candidateWorker
+        $adapter = $candidateAdapter
+        $filePath = $candidatePath
+        break
+    }
+    if ($null -eq $worker) {
+        return New-AiwRunPreflightFailure `
+            -Request $Request `
+            -Code 'NO_RUNNABLE_WORKER' `
+            -FailureKind 'selection_required' `
+            -Message 'No configured worker satisfies the request.' `
+            -Skipped $skipped
+    }
+
     $modelProperty = $worker.PSObject.Properties['model']
     $model = if ($null -eq $modelProperty) { $null } else { [string]$modelProperty.Value }
     if ($adapter.id -ne 'claude-code/v1') {
@@ -601,14 +716,14 @@ function New-AiwRunPlan {
         exitCode = 0
         request = [pscustomobject]@{
             worker = [string]$Request.worker
-            profile = $null
-            route = $null
+            profile = [string]$Request.profile
+            route = [string]$Request.route
             mode = [string]$Request.mode
             requiredCapabilities = @($requiredCapabilities | Select-Object -Unique)
         }
         selection = [pscustomobject]@{
-            resolvedProfile = $null
-            worker = [string]$Request.worker
+            resolvedProfile = if ([string]::IsNullOrWhiteSpace($selectedProfileId)) { $null } else { $selectedProfileId }
+            worker = $selectedWorkerId
             adapter = $adapter.id
             model = $model
         }
@@ -620,6 +735,7 @@ function New-AiwRunPlan {
             environmentOverlay = [pscustomobject]@{}
             allowBatchWorker = $false
         }
+        skipped = @($skipped)
         error = $null
         diagnostics = $null
         warnings = @()
