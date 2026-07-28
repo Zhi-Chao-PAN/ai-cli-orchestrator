@@ -64,6 +64,48 @@ function Read-AiwConfigDocument {
     }
 }
 
+function Test-AiwForbiddenConfigFieldName {
+    param([Parameter(Mandatory)][string]$Name)
+
+    return @(
+        'command',
+        'args',
+        'arguments',
+        'template',
+        'script',
+        'shell',
+        'hook',
+        'env'
+    ) -contains $Name.ToLowerInvariant()
+}
+
+function Test-AiwSecretConfigFieldName {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $normalizedName = ($Name -replace '[-_]', '').ToLowerInvariant()
+    return @(
+        'key',
+        'apikey',
+        'accesskey',
+        'secret',
+        'apisecret',
+        'secretkey',
+        'token',
+        'accesstoken',
+        'authtoken',
+        'refreshtoken',
+        'sessiontoken',
+        'clientsecret',
+        'password',
+        'credential',
+        'credentials',
+        'authorization',
+        'cookie',
+        'setcookie',
+        'bearer'
+    ) -contains $normalizedName
+}
+
 function Get-AiwUnsafeFieldErrors {
     param(
         [AllowNull()]
@@ -96,39 +138,9 @@ function Get-AiwUnsafeFieldErrors {
         return
     }
 
-    $forbiddenFieldNames = @(
-        'command',
-        'args',
-        'arguments',
-        'template',
-        'script',
-        'shell',
-        'hook',
-        'env'
-    )
-    $secretFieldNames = @(
-        'key',
-        'apikey',
-        'accesskey',
-        'secretkey',
-        'token',
-        'accesstoken',
-        'authtoken',
-        'refreshtoken',
-        'sessiontoken',
-        'clientsecret',
-        'password',
-        'credential',
-        'credentials',
-        'authorization',
-        'cookie',
-        'setcookie',
-        'bearer'
-    )
     foreach ($property in $Value.PSObject.Properties) {
         $propertyPath = $Path + '.' + $property.Name
-        $normalizedName = ($property.Name -replace '[-_]', '').ToLowerInvariant()
-        if ($secretFieldNames -contains $normalizedName) {
+        if (Test-AiwSecretConfigFieldName -Name $property.Name) {
             Write-Output ([pscustomobject]@{
                 code = 'FIELD_SECRET_FORBIDDEN'
                 path = $Path + '.<redacted>'
@@ -136,7 +148,7 @@ function Get-AiwUnsafeFieldErrors {
             })
             continue
         }
-        if ($forbiddenFieldNames -contains $property.Name.ToLowerInvariant()) {
+        if (Test-AiwForbiddenConfigFieldName -Name $property.Name) {
             Write-Output ([pscustomobject]@{
                 code = 'FIELD_FORBIDDEN'
                 path = $propertyPath
@@ -145,6 +157,74 @@ function Get-AiwUnsafeFieldErrors {
             continue
         }
         Get-AiwUnsafeFieldErrors -Value $property.Value -Path $propertyPath -Depth ($Depth + 1)
+    }
+}
+
+function Get-AiwAdapterSettingValidationErrors {
+    param(
+        [Parameter(Mandatory)][object]$Adapter,
+        [AllowNull()][object]$Settings,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if ($null -eq $Settings) {
+        $Settings = [pscustomobject]@{}
+    }
+    if ($Settings -isnot [pscustomobject]) {
+        Write-Output ([pscustomobject]@{
+            code = 'FIELD_TYPE_INVALID'
+            path = $Path
+            message = 'Adapter settings must be a JSON object.'
+        })
+        return
+    }
+
+    $allowedFields = switch ($Adapter.id) {
+        'claude-code/v1' { @('configDirectory') }
+        'antigravity/v1' { @() }
+        'minimax-cli/v1' { @('region', 'configDirectory') }
+        default { @() }
+    }
+    foreach ($property in $Settings.PSObject.Properties) {
+        if ($allowedFields -contains $property.Name -or
+            (Test-AiwSecretConfigFieldName -Name $property.Name) -or
+            (Test-AiwForbiddenConfigFieldName -Name $property.Name)) {
+            continue
+        }
+        Write-Output ([pscustomobject]@{
+            code = 'FIELD_UNKNOWN'
+            path = $Path + '.' + $property.Name
+            message = 'Adapter setting is not supported.'
+        })
+    }
+
+    $configDirectoryProperty = $Settings.PSObject.Properties['configDirectory']
+    if ($null -ne $configDirectoryProperty -and
+        ($configDirectoryProperty.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$configDirectoryProperty.Value))) {
+        Write-Output ([pscustomobject]@{
+            code = 'FIELD_TYPE_INVALID'
+            path = $Path + '.configDirectory'
+            message = 'Config directory must be a non-empty string.'
+        })
+    }
+
+    if ($Adapter.id -eq 'minimax-cli/v1') {
+        $regionProperty = $Settings.PSObject.Properties['region']
+        if ($null -eq $regionProperty) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_REQUIRED'
+                path = $Path + '.region'
+                message = 'MiniMax region is required.'
+            })
+        } elseif ($regionProperty.Value -isnot [string] -or
+            @('cn', 'global') -notcontains [string]$regionProperty.Value) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_VALUE_INVALID'
+                path = $Path + '.region'
+                message = 'MiniMax region is not supported.'
+            })
+        }
     }
 }
 
@@ -254,6 +334,26 @@ function Get-AiwWorkerValidationErrors {
             })
             continue
         }
+
+        $modelProperty = $worker.PSObject.Properties['model']
+        if ($adapter.id -eq 'minimax-cli/v1') {
+            if ($null -eq $modelProperty -or
+                $modelProperty.Value -isnot [string] -or
+                [string]$modelProperty.Value -notmatch '^[A-Za-z0-9._-]{1,128}$') {
+                Write-Output ([pscustomobject]@{
+                    code = 'MODEL_INVALID'
+                    path = $workerPath + '.model'
+                    message = 'MiniMax model is invalid.'
+                })
+            }
+        }
+
+        $settingsProperty = $worker.PSObject.Properties['settings']
+        $settingsValue = if ($null -eq $settingsProperty) { $null } else { $settingsProperty.Value }
+        Get-AiwAdapterSettingValidationErrors `
+            -Adapter $adapter `
+            -Settings $settingsValue `
+            -Path ($workerPath + '.settings')
 
         $capabilitiesProperty = $worker.PSObject.Properties['capabilities']
         if ($null -ne $capabilitiesProperty -and $null -ne $capabilitiesProperty.Value) {
@@ -482,6 +582,23 @@ function Resolve-AiwWorkerExecutablePath {
         throw 'Configured executable filename is not allowed for the adapter.'
     }
     return $resolved
+}
+
+function Resolve-AiwConfiguredDirectory {
+    param(
+        [Parameter(Mandatory)][string]$Value,
+        [Parameter(Mandatory)][string]$ConfigDirectory
+    )
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($Value)
+    if (-not [System.IO.Path]::IsPathRooted($expanded)) {
+        $expanded = Join-Path $ConfigDirectory $expanded
+    }
+    $fullPath = [System.IO.Path]::GetFullPath($expanded)
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Container)) {
+        throw 'Configured native profile directory does not exist.'
+    }
+    return (Resolve-Path -LiteralPath $fullPath).Path
 }
 
 function New-AiwRunPreflightFailure {
@@ -769,9 +886,20 @@ function New-AiwRunPlan {
                 '--messages-file', $artifact.path,
                 '--max-tokens', '4096'
             )
-            $environmentOverlay = [pscustomobject]@{
+            $environmentValues = [ordered]@{
                 MINIMAX_BASE_URL = $baseUrl
             }
+            $configDirectoryProperty = if ($null -eq $settings) {
+                $null
+            } else {
+                $settings.PSObject.Properties['configDirectory']
+            }
+            if ($null -ne $configDirectoryProperty) {
+                $environmentValues['MMX_CONFIG_DIR'] = Resolve-AiwConfiguredDirectory `
+                    -Value ([string]$configDirectoryProperty.Value) `
+                    -ConfigDirectory (Split-Path -Parent $loaded.path)
+            }
+            $environmentOverlay = [pscustomobject]$environmentValues
             $allowBatchWorker = [System.IO.Path]::GetExtension($filePath).Equals(
                 '.cmd',
                 [System.StringComparison]::OrdinalIgnoreCase

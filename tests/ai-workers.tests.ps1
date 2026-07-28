@@ -41,6 +41,29 @@ function Invoke-Test {
     Write-Output ('PASS {0}' -f $Name)
 }
 
+function Invoke-PublicConfigValidation {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+    $hostPath = Get-CurrentPowerShellExecutable
+    $validationOutput = & $hostPath `
+        -NoLogo `
+        -NoProfile `
+        -NonInteractive `
+        -File $launcherPath `
+        config `
+        -Action validate `
+        -ConfigPath $Path `
+        -Json
+    $validationExitCode = $LASTEXITCODE
+    $validationText = @($validationOutput) -join [Environment]::NewLine
+    return [pscustomobject]@{
+        exitCode = $validationExitCode
+        text = $validationText
+        result = $validationText | ConvertFrom-Json
+    }
+}
+
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
     'aiw-tests-{0}' -f [guid]::NewGuid().ToString('N')
 )
@@ -636,6 +659,139 @@ try {
         Assert-Equal -Expected '$.workers.stateless.capabilities[1]' -Actual $validation.errors[0].path -Message 'Capability escalation path changed'
     }
 
+    Invoke-Test -Name 'Config validate enforces reviewed adapter-specific settings' -Body {
+        $cases = @(
+            [pscustomobject]@{
+                name = 'minimax-base-url'
+                adapter = 'minimax-cli/v1'
+                settings = [ordered]@{ region = 'cn'; baseUrl = 'https://attacker.invalid' }
+                expectedCode = 'FIELD_UNKNOWN'
+                expectedPath = '$.workers.fixture.settings.baseUrl'
+            },
+            [pscustomobject]@{
+                name = 'minimax-region-enum'
+                adapter = 'minimax-cli/v1'
+                settings = [ordered]@{ region = 'unreviewed' }
+                expectedCode = 'FIELD_VALUE_INVALID'
+                expectedPath = '$.workers.fixture.settings.region'
+            },
+            [pscustomobject]@{
+                name = 'minimax-settings-type'
+                adapter = 'minimax-cli/v1'
+                settings = 'cn'
+                expectedCode = 'FIELD_TYPE_INVALID'
+                expectedPath = '$.workers.fixture.settings'
+            },
+            [pscustomobject]@{
+                name = 'antigravity-config-directory'
+                adapter = 'antigravity/v1'
+                settings = [ordered]@{ configDirectory = '%USERPROFILE%\.unsupported' }
+                expectedCode = 'FIELD_UNKNOWN'
+                expectedPath = '$.workers.fixture.settings.configDirectory'
+            }
+        )
+
+        foreach ($case in $cases) {
+            $configPath = Join-Path $tempRoot ('settings-{0}.json' -f $case.name)
+            $settingsConfig = [ordered]@{
+                schemaVersion = 2
+                defaultRoute = $null
+                defaultProfile = $null
+                workers = [ordered]@{
+                    fixture = [ordered]@{
+                        adapter = $case.adapter
+                        enabled = $true
+                        path = $null
+                        model = 'fixture-model'
+                        capabilities = @('text.reason')
+                        settings = $case.settings
+                    }
+                }
+                profiles = [ordered]@{}
+                routes = [ordered]@{}
+            }
+            [System.IO.File]::WriteAllText(
+                $configPath,
+                (ConvertTo-Json -InputObject $settingsConfig -Depth 10),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            $validation = Invoke-PublicConfigValidation -Path $configPath
+
+            Assert-Equal -Expected 2 -Actual $validation.exitCode -Message ('Adapter settings case returned the wrong exit code: {0}' -f $case.name)
+            Assert-Equal -Expected $case.expectedCode -Actual $validation.result.errors[0].code -Message ('Adapter settings case returned the wrong error: {0}' -f $case.name)
+            Assert-Equal -Expected $case.expectedPath -Actual $validation.result.errors[0].path -Message ('Adapter settings case returned the wrong path: {0}' -f $case.name)
+            Assert-True -Condition (-not $validation.text.Contains('attacker.invalid')) -Message ('Adapter settings case leaked a rejected value: {0}' -f $case.name)
+        }
+    }
+
+    Invoke-Test -Name 'Config validate accepts MiniMax reviewed region and config directory' -Body {
+        $configPath = Join-Path $tempRoot 'settings-minimax-reviewed.json'
+        $settingsConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                fixture = [ordered]@{
+                    adapter = 'minimax-cli/v1'
+                    enabled = $true
+                    path = $null
+                    model = 'fixture-model'
+                    capabilities = @('text.reason')
+                    settings = [ordered]@{
+                        region = 'global'
+                        configDirectory = '%USERPROFILE%\.mmx'
+                    }
+                }
+            }
+            profiles = [ordered]@{}
+            routes = [ordered]@{}
+        }
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $settingsConfig -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $validation = Invoke-PublicConfigValidation -Path $configPath
+
+        Assert-Equal -Expected 0 -Actual $validation.exitCode -Message 'Reviewed MiniMax settings were rejected'
+        Assert-True -Condition $validation.result.ok -Message 'Reviewed MiniMax settings validation failed'
+    }
+
+    Invoke-Test -Name 'Config validate rejects unsafe MiniMax model values before launch' -Body {
+        $models = @('bad&model', ('m' * 129))
+        foreach ($model in $models) {
+            $configPath = Join-Path $tempRoot ('unsafe-minimax-model-{0}.json' -f $model.Length)
+            $modelConfig = [ordered]@{
+                schemaVersion = 2
+                defaultRoute = $null
+                defaultProfile = $null
+                workers = [ordered]@{
+                    fixture = [ordered]@{
+                        adapter = 'minimax-cli/v1'
+                        enabled = $true
+                        path = $null
+                        model = $model
+                        capabilities = @('text.reason')
+                        settings = [ordered]@{ region = 'cn' }
+                    }
+                }
+                profiles = [ordered]@{}
+                routes = [ordered]@{}
+            }
+            [System.IO.File]::WriteAllText(
+                $configPath,
+                (ConvertTo-Json -InputObject $modelConfig -Depth 10),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            $validation = Invoke-PublicConfigValidation -Path $configPath
+
+            Assert-Equal -Expected 2 -Actual $validation.exitCode -Message 'Unsafe MiniMax model returned the wrong exit code'
+            Assert-Equal -Expected 'MODEL_INVALID' -Actual $validation.result.errors[0].code -Message 'Unsafe MiniMax model error code changed'
+            Assert-Equal -Expected '$.workers.fixture.model' -Actual $validation.result.errors[0].path -Message 'Unsafe MiniMax model path changed'
+            Assert-True -Condition (-not $validation.text.Contains($model)) -Message 'Unsafe MiniMax model value leaked into validation output'
+        }
+    }
+
     Invoke-Test -Name 'Config validate prevents routes from defaulting to write' -Body {
         $configPath = Join-Path $tempRoot 'route-default-write-v2.json'
         $routeConfig = [ordered]@{
@@ -979,9 +1135,11 @@ try {
 
     Invoke-Test -Name 'Run invokes a named MiniMax worker through an ephemeral UTF-8 message file' -Body {
         $workerPath = Join-Path $tempRoot 'mmx.ps1'
+        $configDirectory = Join-Path $tempRoot 'mmx-config'
         $configPath = Join-Path $tempRoot 'run-minimax-v2.json'
         $promptPath = Join-Path $tempRoot 'run-minimax-prompt.md'
         $expectedPrompt = 'MiniMax UTF-8 ' + [string][char]0x5DE5 + [string][char]0x4F5C + [string][char]0x5355
+        [void](New-Item -ItemType Directory -Path $configDirectory)
         $fixtureScript = @'
 $messagesIndex = [Array]::IndexOf([object[]]$args, '--messages-file')
 $baseUrlIndex = [Array]::IndexOf([object[]]$args, '--base-url')
@@ -994,6 +1152,7 @@ $result = [pscustomobject]@{
     messagesFile = $messagesPath
     argumentBaseUrl = [string]$args[$baseUrlIndex + 1]
     environmentBaseUrl = [string]$env:MINIMAX_BASE_URL
+    environmentConfigDirectory = [string]$env:MMX_CONFIG_DIR
 }
 [Console]::Write(($result | ConvertTo-Json -Compress))
 '@
@@ -1018,7 +1177,10 @@ $result = [pscustomobject]@{
                     path = $workerPath
                     model = 'fixture-model'
                     capabilities = @('text.reason')
-                    settings = [ordered]@{ region = 'cn' }
+                    settings = [ordered]@{
+                        region = 'cn'
+                        configDirectory = $configDirectory
+                    }
                 }
             }
             profiles = [ordered]@{}
@@ -1054,6 +1216,7 @@ $result = [pscustomobject]@{
         Assert-Equal -Expected $expectedPrompt -Actual $run.output.prompt -Message 'MiniMax run changed the UTF-8 work order'
         Assert-Equal -Expected 'https://api.minimaxi.com' -Actual $run.output.argumentBaseUrl -Message 'MiniMax CN region argument endpoint changed'
         Assert-Equal -Expected 'https://api.minimaxi.com' -Actual $run.output.environmentBaseUrl -Message 'MiniMax CN region environment endpoint changed'
+        Assert-Equal -Expected $configDirectory -Actual $run.output.environmentConfigDirectory -Message 'MiniMax config directory was not isolated through MMX_CONFIG_DIR'
         Assert-True -Condition (-not (Test-Path -LiteralPath (Split-Path -Parent $run.output.messagesFile))) -Message 'MiniMax ephemeral message directory was not removed'
     }
 
