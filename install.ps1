@@ -83,7 +83,10 @@ if ($PSCmdlet.ShouldProcess($installRootFull, 'install AI CLI Orchestrator')) {
 param()
 $entryPoint = Join-Path (Split-Path -Parent $PSScriptRoot) 'app\ai-workers.ps1'
 & $entryPoint @args
-exit $LASTEXITCODE
+if (-not $?) {
+    exit 1
+}
+exit 0
 '@
     [System.IO.File]::WriteAllText($launcherPath, $launcher, (New-Object System.Text.UTF8Encoding($false)))
     $marker = [pscustomobject]@{

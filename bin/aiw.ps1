@@ -9,4 +9,7 @@ if (-not (Test-Path -LiteralPath $entryPoint -PathType Leaf)) {
 }
 
 & $entryPoint @args
-exit $LASTEXITCODE
+if (-not $?) {
+    exit 1
+}
+exit 0

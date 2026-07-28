@@ -356,6 +356,48 @@ try {
         Assert-True -Condition $launcherStatus.ok -Message 'Launcher did not preserve JSON mode'
     }
 
+    Invoke-Test -Name 'PowerShell launcher returns zero after a successful worker' -Body {
+        $fakeWorkerPath = Join-Path $tempRoot 'successful-worker.ps1'
+        $configPath = Join-Path $tempRoot 'launcher-success-config.json'
+        [System.IO.File]::WriteAllText(
+            $fakeWorkerPath,
+            '[Console]::Write(([char]123).ToString() + [char]34 + ''fixture'' + [char]34 + '':'' + ''true'' + [char]125)',
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $configObject = [pscustomobject]@{
+            workers = [pscustomobject]@{
+                ark = [pscustomobject]@{
+                    model = 'fixture-model'
+                    path = $fakeWorkerPath
+                }
+            }
+        }
+        $config = ConvertTo-Json -InputObject $configObject -Depth 5 -Compress
+        [System.IO.File]::WriteAllText(
+            $configPath,
+            $config,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $launcherOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            ark `
+            -Prompt 'fixture prompt' `
+            -ConfigPath $configPath `
+            -Json
+        $launcherExitCode = $LASTEXITCODE
+        $launcherResult = $launcherOutput | ConvertFrom-Json
+
+        Assert-Equal -Expected 0 -Actual $launcherExitCode -Message 'Launcher changed a successful worker exit code'
+        Assert-True -Condition $launcherResult.ok -Message 'Launcher changed a successful worker result'
+        Assert-True -Condition $launcherResult.output.fixture -Message 'Launcher lost worker output'
+    }
+
     Write-Output ('All {0} tests passed.' -f $script:Passed)
 } finally {
     $resolvedTempBase = (Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())).Path
