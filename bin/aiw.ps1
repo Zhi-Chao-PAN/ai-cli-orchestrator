@@ -3,9 +3,13 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$entryPoint = Join-Path (Split-Path -Parent $PSScriptRoot) 'ai-workers.ps1'
-if (-not (Test-Path -LiteralPath $entryPoint -PathType Leaf)) {
-    throw ('aiw entry point is missing: {0}' -f $entryPoint)
+$releaseRoot = Split-Path -Parent $PSScriptRoot
+$entryPoint = @(
+    (Join-Path $releaseRoot 'ai-workers.ps1'),
+    (Join-Path $releaseRoot 'app\ai-workers.ps1')
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($entryPoint)) {
+    throw ('aiw entry point is missing below release root: {0}' -f $releaseRoot)
 }
 
 & $entryPoint @args

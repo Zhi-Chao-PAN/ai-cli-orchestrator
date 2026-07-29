@@ -23,6 +23,58 @@ function Assert-ChildPath {
     return $childFull
 }
 
+function Test-AiwOwnershipMarker {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $raw = [System.IO.File]::ReadAllText($Path)
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $false
+        }
+        $marker = $raw | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+
+    if ($null -eq $marker) {
+        return $false
+    }
+    $productProperty = $marker.PSObject.Properties['product']
+    $schemaProperty = $marker.PSObject.Properties['schemaVersion']
+    if ($null -eq $productProperty -or $null -eq $schemaProperty) {
+        return $false
+    }
+    if ([string]$productProperty.Value -cne 'aiw') {
+        return $false
+    }
+
+    $schemaValue = $schemaProperty.Value
+    $isIntegral = $schemaValue -is [byte] -or
+        $schemaValue -is [int16] -or
+        $schemaValue -is [int32] -or
+        $schemaValue -is [int64]
+    if (-not $isIntegral) {
+        return $false
+    }
+    return ([int64]$schemaValue -eq 1)
+}
+
+function Write-AiwOwnershipMarker {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $marker = [ordered]@{
+        product = 'aiw'
+        schemaVersion = 1
+        installedAtUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    $content = (ConvertTo-Json -InputObject $marker -Depth 3) + [Environment]::NewLine
+    [System.IO.File]::WriteAllText($Path, $content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 function Add-UserPathEntry {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -34,13 +86,29 @@ function Add-UserPathEntry {
     [Environment]::SetEnvironmentVariable('Path', (($entries + $Path) -join ';'), 'User')
 }
 
+function New-AiwSkillBackupPath {
+    param([Parameter(Mandatory)][string]$SkillPath)
+
+    $parent = Split-Path -Parent $SkillPath
+    $name = Split-Path -Leaf $SkillPath
+    $timestamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')
+    $candidate = Join-Path $parent ('{0}.bak-{1}' -f $name, $timestamp)
+    $suffix = 1
+    while (Test-Path -LiteralPath $candidate) {
+        $candidate = Join-Path $parent ('{0}.bak-{1}-{2}' -f $name, $timestamp, $suffix)
+        $suffix++
+    }
+    return $candidate
+}
+
 $sourceRoot = $PSScriptRoot
 $requiredPaths = @(
     (Join-Path $sourceRoot 'ai-workers.ps1'),
     (Join-Path $sourceRoot 'bin\aiw.ps1'),
     (Join-Path $sourceRoot 'src\Aiw.Core.psm1'),
     (Join-Path $sourceRoot 'config.example.json'),
-    (Join-Path $sourceRoot 'skill-src\dispatch-ai-workers\SKILL.md')
+    (Join-Path $sourceRoot 'skill-src\dispatch-ai-workers\SKILL.md'),
+    (Join-Path $sourceRoot 'skill-src\dispatch-ai-workers\agents\openai.yaml')
 )
 foreach ($requiredPath in $requiredPaths) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
@@ -48,25 +116,47 @@ foreach ($requiredPath in $requiredPaths) {
     }
 }
 
-$installRootFull = [System.IO.Path]::GetFullPath($InstallRoot)
+$installRootFull = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+if ([string]::IsNullOrWhiteSpace($installRootFull)) {
+    throw 'Installation root is invalid.'
+}
 $appDirectory = Assert-ChildPath -Parent $installRootFull -Child (Join-Path $installRootFull 'app')
 $binDirectory = Assert-ChildPath -Parent $installRootFull -Child (Join-Path $installRootFull 'bin')
 $markerPath = Join-Path $appDirectory '.aiw-install.json'
+$skillRoot = Join-Path $env:USERPROFILE '.codex\skills\dispatch-ai-workers'
+$skillMarkerPath = Join-Path $skillRoot '.aiw-skill-install.json'
+$skillPathExists = Test-Path -LiteralPath $skillRoot
+$skillDirectoryExists = Test-Path -LiteralPath $skillRoot -PathType Container
 
-if (Test-Path -LiteralPath $appDirectory) {
+$appPathExists = Test-Path -LiteralPath $appDirectory
+if ($appPathExists -and -not (Test-Path -LiteralPath $appDirectory -PathType Container)) {
+    throw ('Refusing to install over a non-directory application path: {0}' -f $appDirectory)
+}
+if ($appPathExists) {
     if (-not $Force) {
         throw ('Installation already exists at {0}. Re-run with -Force after reviewing it.' -f $appDirectory)
     }
-    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
-        throw ('Refusing to replace an unmarked directory: {0}' -f $appDirectory)
+    if (-not (Test-AiwOwnershipMarker -Path $markerPath)) {
+        throw ('Refusing to replace an installation without a valid AIW marker: {0}' -f $appDirectory)
     }
-    if ($PSCmdlet.ShouldProcess($appDirectory, 'replace existing AIW application files')) {
-        Remove-Item -LiteralPath $appDirectory -Recurse -Force
+} elseif (Test-Path -LiteralPath $installRootFull -PathType Container) {
+    $rootItems = @(Get-ChildItem -LiteralPath $installRootFull -Force)
+    if ($rootItems.Count -gt 0) {
+        throw ('Refusing to install into a nonempty root without an AIW application marker: {0}' -f $installRootFull)
     }
 }
 
+if ($InstallCodexSkill -and $skillPathExists -and -not $skillDirectoryExists) {
+    throw ('Refusing to replace a non-directory Codex skill path: {0}' -f $skillRoot)
+}
+
 $installed = $false
+$skillBackupPath = $null
 if ($PSCmdlet.ShouldProcess($installRootFull, 'install AI CLI Orchestrator')) {
+    if ($appPathExists) {
+        Remove-Item -LiteralPath $appDirectory -Recurse -Force
+    }
+
     [void](New-Item -ItemType Directory -Path $appDirectory -Force)
     [void](New-Item -ItemType Directory -Path $binDirectory -Force)
 
@@ -79,46 +169,21 @@ if ($PSCmdlet.ShouldProcess($installRootFull, 'install AI CLI Orchestrator')) {
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'bin\aiw.ps1') -Destination (Join-Path $binDirectory 'aiw.ps1') -Force
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'src') -Destination (Join-Path $appDirectory 'src') -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'skill-src') -Destination (Join-Path $appDirectory 'skill-src') -Recurse -Force
-
-    $launcherPath = Join-Path $binDirectory 'aiw.ps1'
-    $launcher = @'
-param()
-$entryPoint = Join-Path (Split-Path -Parent $PSScriptRoot) 'app\ai-workers.ps1'
-& $entryPoint @args
-$entryPointSucceeded = $?
-$entryPointExitCode = Get-Variable -Name LASTEXITCODE -ValueOnly -ErrorAction SilentlyContinue
-if ($null -ne $entryPointExitCode) {
-    exit [int]$entryPointExitCode
-}
-if (-not $entryPointSucceeded) {
-    exit 1
-}
-exit 0
-'@
-    [System.IO.File]::WriteAllText($launcherPath, $launcher, (New-Object System.Text.UTF8Encoding($false)))
-    $marker = [pscustomobject]@{
-        product = 'aiw'
-        schemaVersion = 1
-        installedAtUtc = [DateTime]::UtcNow.ToString('o')
-    }
-    ConvertTo-Json -InputObject $marker -Depth 3 | Set-Content -LiteralPath $markerPath -Encoding UTF8
-
-    $configDirectory = Join-Path $env:USERPROFILE '.aiw'
-    $configPath = Join-Path $configDirectory 'config.json'
-    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-        [void](New-Item -ItemType Directory -Path $configDirectory -Force)
-        Copy-Item -LiteralPath (Join-Path $appDirectory 'config.example.json') -Destination $configPath
-    }
+    Write-AiwOwnershipMarker -Path $markerPath
 
     if ($InstallCodexSkill) {
-        $skillRoot = Join-Path $env:USERPROFILE '.codex\skills\dispatch-ai-workers'
-        if (Test-Path -LiteralPath $skillRoot -PathType Container) {
-            $backupPath = '{0}.bak-{1}' -f $skillRoot, [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')
-            Copy-Item -LiteralPath $skillRoot -Destination $backupPath -Recurse -Force
+        if ($skillDirectoryExists) {
+            if (-not (Test-AiwOwnershipMarker -Path $skillMarkerPath)) {
+                $skillBackupPath = New-AiwSkillBackupPath -SkillPath $skillRoot
+                Copy-Item -LiteralPath $skillRoot -Destination $skillBackupPath -Recurse -Force
+            }
+            Remove-Item -LiteralPath $skillRoot -Recurse -Force
         }
         [void](New-Item -ItemType Directory -Path $skillRoot -Force)
-        Copy-Item -LiteralPath (Join-Path $appDirectory 'skill-src\dispatch-ai-workers\SKILL.md') -Destination (Join-Path $skillRoot 'SKILL.md') -Force
-        Copy-Item -LiteralPath (Join-Path $appDirectory 'skill-src\dispatch-ai-workers\agents') -Destination $skillRoot -Recurse -Force
+        $skillSource = Join-Path $appDirectory 'skill-src\dispatch-ai-workers'
+        Copy-Item -LiteralPath (Join-Path $skillSource 'SKILL.md') -Destination (Join-Path $skillRoot 'SKILL.md') -Force
+        Copy-Item -LiteralPath (Join-Path $skillSource 'agents') -Destination $skillRoot -Recurse -Force
+        Write-AiwOwnershipMarker -Path $skillMarkerPath
     }
 
     if ($AddToPath) {
@@ -129,6 +194,9 @@ exit 0
 
 if ($installed) {
     Write-Output ('Installed AIW to {0}' -f $installRootFull)
+    if ($null -ne $skillBackupPath) {
+        Write-Output ('Backed up the previous Codex skill to {0}' -f $skillBackupPath)
+    }
     Write-Output ('Run: & {0} doctor -Json' -f (Join-Path $binDirectory 'aiw.ps1'))
 } else {
     Write-Output 'Installation was not applied because WhatIf was specified.'
