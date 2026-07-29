@@ -534,6 +534,80 @@ try {
         Assert-Equal -Expected 0 -Actual @($validation.errors).Count -Message 'Neutral config returned validation errors'
     }
 
+    Invoke-Test -Name 'Config validate returns stable structured errors for parse encoding size and schema failures' -Body {
+        $cases = @(
+            [pscustomobject]@{
+                name = 'invalid-json'
+                expectedCode = 'JSON_INVALID'
+                write = {
+                    param($path)
+                    [System.IO.File]::WriteAllText($path, '{ invalid json')
+                }
+            },
+            [pscustomobject]@{
+                name = 'invalid-utf8'
+                expectedCode = 'ENCODING_INVALID'
+                write = {
+                    param($path)
+                    [System.IO.File]::WriteAllBytes($path, [byte[]](0xFF, 0xFE, 0xFA))
+                }
+            },
+            [pscustomobject]@{
+                name = 'oversized'
+                expectedCode = 'CONFIG_LIMIT_EXCEEDED'
+                write = {
+                    param($path)
+                    [System.IO.File]::WriteAllText($path, (' ' * 1048577))
+                }
+            },
+            [pscustomobject]@{
+                name = 'schema'
+                expectedCode = 'SCHEMA_VERSION_UNSUPPORTED'
+                write = {
+                    param($path)
+                    Write-TestJson -Path $path -Value ([ordered]@{
+                        schemaVersion = 3
+                        workers = [ordered]@{}
+                        profiles = [ordered]@{}
+                        routes = [ordered]@{}
+                    })
+                }
+            }
+        )
+
+        foreach ($case in $cases) {
+            $configPath = Join-Path $tempRoot ('invalid-config-{0}.json' -f $case.name)
+            & $case.write $configPath
+            $validation = Invoke-PublicConfigValidation -Path $configPath
+
+            Assert-Equal -Expected 2 -Actual $validation.exitCode -Message ('Invalid config returned the wrong exit code: {0}' -f $case.name)
+            Assert-True -Condition (-not $validation.result.ok) -Message ('Invalid config was accepted: {0}' -f $case.name)
+            Assert-Equal -Expected 'config_invalid' -Actual $validation.result.failureKind -Message ('Invalid config failure kind changed: {0}' -f $case.name)
+            Assert-Equal -Expected 'CONFIG_INVALID' -Actual $validation.result.error.code -Message ('Invalid config envelope code changed: {0}' -f $case.name)
+            Assert-Equal -Expected $case.expectedCode -Actual $validation.result.errors[0].code -Message ('Invalid config detail code changed: {0}' -f $case.name)
+        }
+    }
+
+    Invoke-Test -Name 'Config validate accepts legacy schema v1 for in-memory migration compatibility' -Body {
+        $configPath = Join-Path $tempRoot 'legacy-v1-validation.json'
+        $legacyConfig = [ordered]@{
+            schemaVersion = 1
+            workers = [ordered]@{
+                ark = [ordered]@{
+                    path = $null
+                    model = 'glm-5.2'
+                    configPath = '%USERPROFILE%\.claude\settings.json'
+                }
+            }
+        }
+        Write-TestJson -Path $configPath -Value $legacyConfig
+        $validation = Invoke-PublicConfigValidation -Path $configPath
+
+        Assert-Equal -Expected 0 -Actual $validation.exitCode -Message 'Legacy schema v1 validation failed'
+        Assert-True -Condition $validation.result.ok -Message 'Legacy schema v1 was rejected'
+        Assert-Equal -Expected 1 -Actual $validation.result.configSchemaVersion -Message 'Legacy schema version was not reported'
+    }
+
     Invoke-Test -Name 'Config validate rejects command fields without echoing values' -Body {
         $configPath = Join-Path $tempRoot 'forbidden-command-v2.json'
         $secretSentinel = 'DO_NOT_ECHO_CONFIG_SENTINEL'
@@ -936,6 +1010,65 @@ try {
             Assert-Equal -Expected 2 -Actual $validation.exitCode -Message ('Fallback case returned the wrong exit code: {0}' -f $case.name)
             Assert-Equal -Expected $case.expectedCode -Actual $validation.result.errors[0].code -Message ('Fallback case returned the wrong code: {0}' -f $case.name)
             Assert-Equal -Expected $case.expectedPath -Actual $validation.result.errors[0].path -Message ('Fallback case returned the wrong path: {0}' -f $case.name)
+        }
+    }
+
+    Invoke-Test -Name 'Config validate enforces exact default and reference resolution' -Body {
+        $cases = @(
+            [pscustomobject]@{
+                name = 'default-route-missing'
+                mutate = { param($config) $config.defaultRoute = 'missing' }
+                expectedCode = 'ROUTE_NOT_FOUND'
+                expectedPath = '$.defaultRoute'
+            },
+            [pscustomobject]@{
+                name = 'default-profile-missing'
+                mutate = { param($config) $config.defaultProfile = 'missing' }
+                expectedCode = 'PROFILE_NOT_FOUND'
+                expectedPath = '$.defaultProfile'
+            },
+            [pscustomobject]@{
+                name = 'default-conflict'
+                mutate = { param($config) $config.defaultRoute = 'review'; $config.defaultProfile = 'standard' }
+                expectedCode = 'DEFAULT_SELECTION_CONFLICT'
+                expectedPath = '$'
+            },
+            [pscustomobject]@{
+                name = 'default-type'
+                mutate = { param($config) $config.defaultRoute = 7 }
+                expectedCode = 'FIELD_TYPE_INVALID'
+                expectedPath = '$.defaultRoute'
+            },
+            [pscustomobject]@{
+                name = 'profile-case'
+                mutate = { param($config) $config.routes.review.profile = 'STANDARD' }
+                expectedCode = 'PROFILE_NOT_FOUND'
+                expectedPath = '$.routes.review.profile'
+            },
+            [pscustomobject]@{
+                name = 'worker-case'
+                mutate = { param($config) $config.profiles.standard.workers = @('FIXTURE') }
+                expectedCode = 'WORKER_NOT_FOUND'
+                expectedPath = '$.profiles.standard.workers[0]'
+            },
+            [pscustomobject]@{
+                name = 'worker-duplicate'
+                mutate = { param($config) $config.profiles.standard.workers = @('fixture', 'fixture') }
+                expectedCode = 'FIELD_VALUE_INVALID'
+                expectedPath = '$.profiles.standard.workers[1]'
+            }
+        )
+
+        foreach ($case in $cases) {
+            $config = New-RoutingFixtureConfig
+            & $case.mutate $config
+            $configPath = Join-Path $tempRoot ('reference-{0}.json' -f $case.name)
+            Write-TestJson -Path $configPath -Value $config
+            $validation = Invoke-PublicConfigValidation -Path $configPath
+
+            Assert-Equal -Expected 2 -Actual $validation.exitCode -Message ('Reference case returned the wrong exit code: {0}' -f $case.name)
+            Assert-Equal -Expected $case.expectedCode -Actual $validation.result.errors[0].code -Message ('Reference case returned the wrong code: {0}' -f $case.name)
+            Assert-Equal -Expected $case.expectedPath -Actual $validation.result.errors[0].path -Message ('Reference case returned the wrong path: {0}' -f $case.name)
         }
     }
 

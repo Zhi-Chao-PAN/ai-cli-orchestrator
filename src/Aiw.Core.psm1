@@ -35,32 +35,74 @@ function Read-AiwConfigDocument {
 
     if ([string]::IsNullOrWhiteSpace($Path) -or
         -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw 'Configuration file does not exist.'
+        throw 'AIW_CONFIG_NOT_FOUND'
     }
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
     $item = Get-Item -LiteralPath $resolvedPath
     if ($item.Length -gt 1048576) {
-        throw 'Configuration file exceeds the 1048576-byte limit.'
+        throw 'AIW_CONFIG_LIMIT_EXCEEDED'
     }
 
     $reader = New-Object System.IO.StreamReader(
         $resolvedPath,
         (New-Object System.Text.UTF8Encoding($false, $true)),
-        $true
+        $false
     )
     try {
-        $text = $reader.ReadToEnd()
+        try {
+            $text = $reader.ReadToEnd()
+        } catch {
+            throw 'AIW_ENCODING_INVALID'
+        }
     } finally {
         $reader.Dispose()
     }
     try {
         $document = $text | ConvertFrom-Json
     } catch {
-        throw 'Configuration is not valid JSON.'
+        throw 'AIW_JSON_INVALID'
     }
     return [pscustomobject]@{
         path = $resolvedPath
         document = $document
+    }
+}
+
+function New-AiwConfigValidationFailure {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$ErrorPath,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    $displayPath = try {
+        [System.IO.Path]::GetFullPath($Path)
+    } catch {
+        $null
+    }
+    return [pscustomobject]@{
+        schemaVersion = 2
+        ok = $false
+        command = 'config'
+        action = 'validate'
+        configSchemaVersion = $null
+        configPath = $displayPath
+        exitCode = 2
+        failureKind = 'config_invalid'
+        errors = @(
+            [pscustomobject]@{
+                code = $Code
+                path = $ErrorPath
+                message = $Message
+            }
+        )
+        error = [pscustomobject]@{
+            code = 'CONFIG_INVALID'
+            message = 'Configuration validation failed.'
+        }
+        diagnostics = $null
+        warnings = @()
     }
 }
 
@@ -123,6 +165,88 @@ function Test-AiwIntegerValue {
         [System.TypeCode]::Int64,
         [System.TypeCode]::UInt64
     ) -contains $typeCode
+}
+
+function Get-AiwExactObjectProperty {
+    param(
+        [AllowNull()][object]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $Object -or $Object -isnot [pscustomobject]) {
+        return $null
+    }
+    $matches = @(
+        $Object.PSObject.Properties |
+            Where-Object { $_.Name -ceq $Name } |
+            Select-Object -First 1
+    )
+    if ($matches.Count -eq 0) {
+        return $null
+    }
+    return $matches[0]
+}
+
+function Get-AiwDefaultSelectionValidationErrors {
+    param(
+        [Parameter(Mandatory)][object]$Document,
+        [AllowNull()][object]$Profiles,
+        [AllowNull()][object]$Routes
+    )
+
+    $resolvedValues = @{}
+    foreach ($name in @('defaultRoute', 'defaultProfile')) {
+        $property = $Document.PSObject.Properties[$name]
+        if ($null -eq $property -or $null -eq $property.Value) {
+            $resolvedValues[$name] = $null
+            continue
+        }
+        if ($property.Value -isnot [string]) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = '$.' + $name
+                message = 'Default selector must be null or a string.'
+            })
+            $resolvedValues[$name] = $null
+            continue
+        }
+        $value = [string]$property.Value
+        if ($value -notmatch '^[a-z][a-z0-9._-]{0,63}$') {
+            Write-Output ([pscustomobject]@{
+                code = 'ID_INVALID'
+                path = '$.' + $name
+                message = 'Default selector ID is invalid.'
+            })
+            $resolvedValues[$name] = $null
+            continue
+        }
+        $resolvedValues[$name] = $value
+    }
+
+    if ($null -ne $resolvedValues['defaultRoute'] -and
+        $null -ne $resolvedValues['defaultProfile']) {
+        Write-Output ([pscustomobject]@{
+            code = 'DEFAULT_SELECTION_CONFLICT'
+            path = '$'
+            message = 'Only one default selector may be configured.'
+        })
+    }
+    if ($null -ne $resolvedValues['defaultRoute'] -and
+        $null -eq (Get-AiwExactObjectProperty -Object $Routes -Name $resolvedValues['defaultRoute'])) {
+        Write-Output ([pscustomobject]@{
+            code = 'ROUTE_NOT_FOUND'
+            path = '$.defaultRoute'
+            message = 'Default route does not exist.'
+        })
+    }
+    if ($null -ne $resolvedValues['defaultProfile'] -and
+        $null -eq (Get-AiwExactObjectProperty -Object $Profiles -Name $resolvedValues['defaultProfile'])) {
+        Write-Output ([pscustomobject]@{
+            code = 'PROFILE_NOT_FOUND'
+            path = '$.defaultProfile'
+            message = 'Default profile does not exist.'
+        })
+    }
 }
 
 function Get-AiwUnsafeFieldErrors {
@@ -633,9 +757,19 @@ function Get-AiwProfileValidationErrors {
             })
             continue
         }
+        $seenWorkerIds = @{}
         for ($index = 0; $index -lt $workerList.Count; $index++) {
             $workerId = [string]$workerList[$index]
-            if ($null -eq $Workers -or $null -eq $Workers.PSObject.Properties[$workerId]) {
+            if ($seenWorkerIds.ContainsKey($workerId)) {
+                Write-Output ([pscustomobject]@{
+                    code = 'FIELD_VALUE_INVALID'
+                    path = ('{0}.workers[{1}]' -f $profilePath, $index)
+                    message = 'Profile worker references must be unique.'
+                })
+                continue
+            }
+            $seenWorkerIds[$workerId] = $true
+            if ($null -eq (Get-AiwExactObjectProperty -Object $Workers -Name $workerId)) {
                 Write-Output ([pscustomobject]@{
                     code = 'WORKER_NOT_FOUND'
                     path = ('{0}.workers[{1}]' -f $profilePath, $index)
@@ -706,8 +840,7 @@ function Get-AiwRouteValidationErrors {
         $profileProperty = $route.PSObject.Properties['profile']
         $profileId = if ($null -eq $profileProperty) { $null } else { [string]$profileProperty.Value }
         if ([string]::IsNullOrWhiteSpace($profileId) -or
-            $null -eq $Profiles -or
-            $null -eq $Profiles.PSObject.Properties[$profileId]) {
+            $null -eq (Get-AiwExactObjectProperty -Object $Profiles -Name $profileId)) {
             Write-Output ([pscustomobject]@{
                 code = 'PROFILE_NOT_FOUND'
                 path = $routePath + '.profile'
@@ -1236,12 +1369,54 @@ function New-AiwConfigValidationResult {
         [string]$Path
     )
 
-    $loaded = Read-AiwConfigDocument -Path $Path
+    try {
+        $loaded = Read-AiwConfigDocument -Path $Path
+    } catch {
+        $detailCode = switch ($_.Exception.Message) {
+            'AIW_CONFIG_NOT_FOUND' { 'CONFIG_NOT_FOUND' }
+            'AIW_CONFIG_LIMIT_EXCEEDED' { 'CONFIG_LIMIT_EXCEEDED' }
+            'AIW_ENCODING_INVALID' { 'ENCODING_INVALID' }
+            'AIW_JSON_INVALID' { 'JSON_INVALID' }
+            default { 'JSON_INVALID' }
+        }
+        return New-AiwConfigValidationFailure `
+            -Path $Path `
+            -Code $detailCode `
+            -ErrorPath '$' `
+            -Message 'Configuration could not be parsed safely.'
+    }
+    if ($null -eq $loaded.document -or $loaded.document -isnot [pscustomobject]) {
+        return New-AiwConfigValidationFailure `
+            -Path $loaded.path `
+            -Code 'FIELD_TYPE_INVALID' `
+            -ErrorPath '$' `
+            -Message 'Configuration root must be a JSON object.'
+    }
     $schemaProperty = $loaded.document.PSObject.Properties['schemaVersion']
     if ($null -eq $schemaProperty -or
-        $schemaProperty.Value -isnot [int] -or
-        [int]$schemaProperty.Value -ne 2) {
-        throw 'Configuration schemaVersion must be the integer 2.'
+        -not (Test-AiwIntegerValue -Value $schemaProperty.Value) -or
+        @([int64]1, [int64]2) -notcontains [int64]$schemaProperty.Value) {
+        return New-AiwConfigValidationFailure `
+            -Path $loaded.path `
+            -Code 'SCHEMA_VERSION_UNSUPPORTED' `
+            -ErrorPath '$.schemaVersion' `
+            -Message 'Configuration schemaVersion must be the integer 1 or 2.'
+    }
+    if ([int64]$schemaProperty.Value -eq 1) {
+        return [pscustomobject]@{
+            schemaVersion = 2
+            ok = $true
+            command = 'config'
+            action = 'validate'
+            configSchemaVersion = 1
+            configPath = $loaded.path
+            exitCode = 0
+            failureKind = $null
+            errors = @()
+            error = $null
+            diagnostics = $null
+            warnings = @('Schema v1 remains supported through the frozen compatibility facade; migrate to schema v2 for generic routing.')
+        }
     }
 
     $allowedTopLevelFields = @(
@@ -1276,6 +1451,12 @@ function New-AiwConfigValidationResult {
     $routesProperty = $loaded.document.PSObject.Properties['routes']
     $routesValue = if ($null -eq $routesProperty) { $null } else { $routesProperty.Value }
     $errors += @(Get-AiwRouteValidationErrors -Routes $routesValue -Profiles $profilesValue)
+    $errors += @(
+        Get-AiwDefaultSelectionValidationErrors `
+            -Document $loaded.document `
+            -Profiles $profilesValue `
+            -Routes $routesValue
+    )
 
     if ($errors.Count -gt 0) {
         return [pscustomobject]@{
