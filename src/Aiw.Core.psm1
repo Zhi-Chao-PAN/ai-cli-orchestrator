@@ -106,6 +106,25 @@ function Test-AiwSecretConfigFieldName {
     ) -contains $normalizedName
 }
 
+function Test-AiwIntegerValue {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return $false
+    }
+    $typeCode = [System.Type]::GetTypeCode($Value.GetType())
+    return @(
+        [System.TypeCode]::SByte,
+        [System.TypeCode]::Byte,
+        [System.TypeCode]::Int16,
+        [System.TypeCode]::UInt16,
+        [System.TypeCode]::Int32,
+        [System.TypeCode]::UInt32,
+        [System.TypeCode]::Int64,
+        [System.TypeCode]::UInt64
+    ) -contains $typeCode
+}
+
 function Get-AiwUnsafeFieldErrors {
     param(
         [AllowNull()]
@@ -343,7 +362,53 @@ function Get-AiwWorkerValidationErrors {
             }
         }
 
+
+        $enabledProperty = $worker.PSObject.Properties['enabled']
+        if ($null -ne $enabledProperty -and $enabledProperty.Value -isnot [bool]) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = $workerPath + '.enabled'
+                message = 'Worker enabled must be a boolean.'
+            })
+        }
+        $pathProperty = $worker.PSObject.Properties['path']
+        if ($null -ne $pathProperty -and $null -ne $pathProperty.Value -and
+            ($pathProperty.Value -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$pathProperty.Value))) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = $workerPath + '.path'
+                message = 'Worker path must be null or a non-empty string.'
+            })
+        }
+        $modelProperty = $worker.PSObject.Properties['model']
+        if ($null -ne $modelProperty -and $null -ne $modelProperty.Value -and
+            $modelProperty.Value -isnot [string]) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = $workerPath + '.model'
+                message = 'Worker model must be null or a string.'
+            })
+        } elseif ($null -ne $modelProperty -and $modelProperty.Value -is [string] -and
+            ([string]::IsNullOrWhiteSpace([string]$modelProperty.Value) -or
+            ([string]$modelProperty.Value).Length -gt 256 -or
+            [string]$modelProperty.Value -match '[\x00-\x1F\x7F]')) {
+            Write-Output ([pscustomobject]@{
+                code = 'MODEL_INVALID'
+                path = $workerPath + '.model'
+                message = 'Worker model is invalid.'
+            })
+        }
+
         $adapterProperty = $worker.PSObject.Properties['adapter']
+        if ($null -ne $adapterProperty -and $adapterProperty.Value -isnot [string]) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = $workerPath + '.adapter'
+                message = 'Worker adapter must be a string.'
+            })
+            continue
+        }
         $adapterId = if ($null -eq $adapterProperty) { $null } else { [string]$adapterProperty.Value }
         $adapter = if ([string]::IsNullOrWhiteSpace($adapterId)) {
             $null
@@ -359,7 +424,6 @@ function Get-AiwWorkerValidationErrors {
             continue
         }
 
-        $modelProperty = $worker.PSObject.Properties['model']
         if ($adapter.id -eq 'minimax-cli/v1') {
             if ($null -eq $modelProperty -or
                 $modelProperty.Value -isnot [string] -or
@@ -381,6 +445,14 @@ function Get-AiwWorkerValidationErrors {
 
         $capabilitiesProperty = $worker.PSObject.Properties['capabilities']
         if ($null -ne $capabilitiesProperty -and $null -ne $capabilitiesProperty.Value) {
+            if ($capabilitiesProperty.Value -isnot [System.Array]) {
+                Write-Output ([pscustomobject]@{
+                    code = 'FIELD_TYPE_INVALID'
+                    path = $workerPath + '.capabilities'
+                    message = 'Worker capabilities must be an array.'
+                })
+                continue
+            }
             $capabilities = @($capabilitiesProperty.Value)
             for ($index = 0; $index -lt $capabilities.Count; $index++) {
                 $capability = [string]$capabilities[$index]
@@ -391,6 +463,94 @@ function Get-AiwWorkerValidationErrors {
                         message = 'Capability is not supported by the selected adapter.'
                     })
                 }
+            }
+        }
+    }
+}
+
+function Get-AiwFallbackValidationErrors {
+    param(
+        [AllowNull()][object]$Fallback,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if ($null -eq $Fallback) {
+        return
+    }
+    if ($Fallback -isnot [pscustomobject]) {
+        Write-Output ([pscustomobject]@{
+            code = 'FIELD_TYPE_INVALID'
+            path = $Path
+            message = 'Fallback policy must be a JSON object.'
+        })
+        return
+    }
+
+    foreach ($property in $Fallback.PSObject.Properties) {
+        if (@('maxAttempts', 'on') -notcontains $property.Name) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_UNKNOWN'
+                path = $Path + '.' + $property.Name
+                message = 'Fallback field is not supported.'
+            })
+        }
+    }
+
+    $maxAttemptsProperty = $Fallback.PSObject.Properties['maxAttempts']
+    if ($null -ne $maxAttemptsProperty) {
+        if (-not (Test-AiwIntegerValue -Value $maxAttemptsProperty.Value)) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = $Path + '.maxAttempts'
+                message = 'Fallback maxAttempts must be an integer.'
+            })
+        } elseif ([int64]$maxAttemptsProperty.Value -lt 1 -or
+            [int64]$maxAttemptsProperty.Value -gt 8) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_VALUE_INVALID'
+                path = $Path + '.maxAttempts'
+                message = 'Fallback maxAttempts is outside the supported range.'
+            })
+        }
+    }
+
+    $onProperty = $Fallback.PSObject.Properties['on']
+    if ($null -ne $onProperty -and $null -ne $onProperty.Value) {
+        if ($onProperty.Value -isnot [System.Array]) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = $Path + '.on'
+                message = 'Fallback on must be an array.'
+            })
+            return
+        }
+        $allowedFailureKinds = @(
+            'authentication',
+            'quota_or_rate_limit',
+            'process_exit',
+            'timeout'
+        )
+        $seenFailureKinds = @{}
+        $failureKinds = @($onProperty.Value)
+        for ($index = 0; $index -lt $failureKinds.Count; $index++) {
+            $failureKind = $failureKinds[$index]
+            if ($failureKind -isnot [string] -or
+                $allowedFailureKinds -notcontains [string]$failureKind) {
+                Write-Output ([pscustomobject]@{
+                    code = 'FALLBACK_KIND_FORBIDDEN'
+                    path = ('{0}.on[{1}]' -f $Path, $index)
+                    message = 'Fallback failure kind is not allowed.'
+                })
+                continue
+            }
+            if ($seenFailureKinds.ContainsKey([string]$failureKind)) {
+                Write-Output ([pscustomobject]@{
+                    code = 'FIELD_VALUE_INVALID'
+                    path = ('{0}.on[{1}]' -f $Path, $index)
+                    message = 'Fallback failure kinds must be unique.'
+                })
+            } else {
+                $seenFailureKinds[[string]$failureKind] = $true
             }
         }
     }
@@ -448,12 +608,23 @@ function Get-AiwProfileValidationErrors {
                 })
             }
         }
+        $fallbackProperty = $profile.PSObject.Properties['fallback']
+        if ($null -ne $fallbackProperty) {
+            Get-AiwFallbackValidationErrors `
+                -Fallback $fallbackProperty.Value `
+                -Path ($profilePath + '.fallback')
+        }
         $workerListProperty = $profile.PSObject.Properties['workers']
-        $workerList = @(
-            if ($null -ne $workerListProperty) {
-                $workerListProperty.Value
-            }
-        )
+        if ($null -eq $workerListProperty -or
+            $workerListProperty.Value -isnot [System.Array]) {
+            Write-Output ([pscustomobject]@{
+                code = 'FIELD_TYPE_INVALID'
+                path = $profilePath + '.workers'
+                message = 'Profile workers must be an array.'
+            })
+            continue
+        }
+        $workerList = @($workerListProperty.Value)
         if ($workerList.Count -eq 0) {
             Write-Output ([pscustomobject]@{
                 code = 'PROFILE_EMPTY'
@@ -552,7 +723,14 @@ function Get-AiwRouteValidationErrors {
             })
         }
         $capabilitiesProperty = $route.PSObject.Properties['requiredCapabilities']
-        if ($null -ne $capabilitiesProperty) {
+        if ($null -ne $capabilitiesProperty -and $null -ne $capabilitiesProperty.Value) {
+            if ($capabilitiesProperty.Value -isnot [System.Array]) {
+                Write-Output ([pscustomobject]@{
+                    code = 'FIELD_TYPE_INVALID'
+                    path = $routePath + '.requiredCapabilities'
+                    message = 'Route capabilities must be an array.'
+                })
+            } else {
             $capabilities = @($capabilitiesProperty.Value)
             for ($index = 0; $index -lt $capabilities.Count; $index++) {
                 if ($knownCapabilities -notcontains [string]$capabilities[$index]) {
@@ -561,6 +739,36 @@ function Get-AiwRouteValidationErrors {
                         path = ('{0}.requiredCapabilities[{1}]' -f $routePath, $index)
                         message = 'Route capability is not recognized.'
                     })
+                }
+            }
+            }
+        }
+        $allowedModesProperty = $route.PSObject.Properties['allowedModes']
+        if ($null -ne $allowedModesProperty -and $null -ne $allowedModesProperty.Value) {
+            if ($allowedModesProperty.Value -isnot [System.Array]) {
+                Write-Output ([pscustomobject]@{
+                    code = 'FIELD_TYPE_INVALID'
+                    path = $routePath + '.allowedModes'
+                    message = 'Route allowedModes must be an array.'
+                })
+            } else {
+                $allowedModes = @($allowedModesProperty.Value)
+                if ($allowedModes.Count -eq 0) {
+                    Write-Output ([pscustomobject]@{
+                        code = 'FIELD_VALUE_INVALID'
+                        path = $routePath + '.allowedModes'
+                        message = 'Route allowedModes cannot be empty.'
+                    })
+                }
+                for ($index = 0; $index -lt $allowedModes.Count; $index++) {
+                    if ($allowedModes[$index] -isnot [string] -or
+                        @('read', 'write') -notcontains [string]$allowedModes[$index]) {
+                        Write-Output ([pscustomobject]@{
+                            code = 'FIELD_VALUE_INVALID'
+                            path = ('{0}.allowedModes[{1}]' -f $routePath, $index)
+                            message = 'Route mode is not supported.'
+                        })
+                    }
                 }
             }
         }

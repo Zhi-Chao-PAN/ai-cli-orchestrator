@@ -64,6 +64,54 @@ function Invoke-PublicConfigValidation {
     }
 }
 
+function Write-TestJson {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object]$Value
+    )
+
+    [System.IO.File]::WriteAllText(
+        $Path,
+        (ConvertTo-Json -InputObject $Value -Depth 20),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
+function New-RoutingFixtureConfig {
+    return [ordered]@{
+        schemaVersion = 2
+        defaultRoute = $null
+        defaultProfile = $null
+        workers = [ordered]@{
+            fixture = [ordered]@{
+                adapter = 'claude-code/v1'
+                enabled = $true
+                path = $null
+                model = 'fixture-model'
+                capabilities = @('text.reason', 'workspace.read')
+                settings = [ordered]@{}
+            }
+        }
+        profiles = [ordered]@{
+            standard = [ordered]@{
+                workers = @('fixture')
+                fallback = [ordered]@{
+                    maxAttempts = 1
+                    on = @()
+                }
+            }
+        }
+        routes = [ordered]@{
+            review = [ordered]@{
+                profile = 'standard'
+                requiredCapabilities = @('text.reason')
+                defaultMode = 'read'
+                allowedModes = @('read')
+            }
+        }
+    }
+}
+
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
     'aiw-tests-{0}' -f [guid]::NewGuid().ToString('N')
 )
@@ -789,6 +837,105 @@ try {
             Assert-Equal -Expected 'MODEL_INVALID' -Actual $validation.result.errors[0].code -Message 'Unsafe MiniMax model error code changed'
             Assert-Equal -Expected '$.workers.fixture.model' -Actual $validation.result.errors[0].path -Message 'Unsafe MiniMax model path changed'
             Assert-True -Condition (-not $validation.text.Contains($model)) -Message 'Unsafe MiniMax model value leaked into validation output'
+        }
+    }
+
+    Invoke-Test -Name 'Config validate rejects scalar values where typed fields require booleans strings or arrays' -Body {
+        $cases = @(
+            [pscustomobject]@{
+                name = 'enabled'
+                mutate = { param($config) $config.workers.fixture.enabled = 1 }
+                expectedPath = '$.workers.fixture.enabled'
+            },
+            [pscustomobject]@{
+                name = 'path'
+                mutate = { param($config) $config.workers.fixture.path = 7 }
+                expectedPath = '$.workers.fixture.path'
+            },
+            [pscustomobject]@{
+                name = 'model'
+                mutate = { param($config) $config.workers.fixture.model = 7 }
+                expectedPath = '$.workers.fixture.model'
+            },
+            [pscustomobject]@{
+                name = 'capabilities'
+                mutate = { param($config) $config.workers.fixture.capabilities = 'text.reason' }
+                expectedPath = '$.workers.fixture.capabilities'
+            },
+            [pscustomobject]@{
+                name = 'profile-workers'
+                mutate = { param($config) $config.profiles.standard.workers = 'fixture' }
+                expectedPath = '$.profiles.standard.workers'
+            },
+            [pscustomobject]@{
+                name = 'route-capabilities'
+                mutate = { param($config) $config.routes.review.requiredCapabilities = 'text.reason' }
+                expectedPath = '$.routes.review.requiredCapabilities'
+            },
+            [pscustomobject]@{
+                name = 'route-modes'
+                mutate = { param($config) $config.routes.review.allowedModes = 'read' }
+                expectedPath = '$.routes.review.allowedModes'
+            }
+        )
+
+        foreach ($case in $cases) {
+            $config = New-RoutingFixtureConfig
+            & $case.mutate $config
+            $configPath = Join-Path $tempRoot ('typed-field-{0}.json' -f $case.name)
+            Write-TestJson -Path $configPath -Value $config
+            $validation = Invoke-PublicConfigValidation -Path $configPath
+
+            Assert-Equal -Expected 2 -Actual $validation.exitCode -Message ('Typed field case returned the wrong exit code: {0}' -f $case.name)
+            Assert-Equal -Expected 'FIELD_TYPE_INVALID' -Actual $validation.result.errors[0].code -Message ('Typed field case returned the wrong code: {0}' -f $case.name)
+            Assert-Equal -Expected $case.expectedPath -Actual $validation.result.errors[0].path -Message ('Typed field case returned the wrong path: {0}' -f $case.name)
+        }
+    }
+
+    Invoke-Test -Name 'Config validate enforces bounded fallback policy shape and failure kinds' -Body {
+        $cases = @(
+            [pscustomobject]@{
+                name = 'fallback-type'
+                value = 'process_exit'
+                expectedCode = 'FIELD_TYPE_INVALID'
+                expectedPath = '$.profiles.standard.fallback'
+            },
+            [pscustomobject]@{
+                name = 'attempts-type'
+                value = [ordered]@{ maxAttempts = '2'; on = @('process_exit') }
+                expectedCode = 'FIELD_TYPE_INVALID'
+                expectedPath = '$.profiles.standard.fallback.maxAttempts'
+            },
+            [pscustomobject]@{
+                name = 'attempts-range'
+                value = [ordered]@{ maxAttempts = 0; on = @('process_exit') }
+                expectedCode = 'FIELD_VALUE_INVALID'
+                expectedPath = '$.profiles.standard.fallback.maxAttempts'
+            },
+            [pscustomobject]@{
+                name = 'on-type'
+                value = [ordered]@{ maxAttempts = 2; on = 'process_exit' }
+                expectedCode = 'FIELD_TYPE_INVALID'
+                expectedPath = '$.profiles.standard.fallback.on'
+            },
+            [pscustomobject]@{
+                name = 'forbidden-kind'
+                value = [ordered]@{ maxAttempts = 2; on = @('permission_denied') }
+                expectedCode = 'FALLBACK_KIND_FORBIDDEN'
+                expectedPath = '$.profiles.standard.fallback.on[0]'
+            }
+        )
+
+        foreach ($case in $cases) {
+            $config = New-RoutingFixtureConfig
+            $config.profiles.standard.fallback = $case.value
+            $configPath = Join-Path $tempRoot ('fallback-{0}.json' -f $case.name)
+            Write-TestJson -Path $configPath -Value $config
+            $validation = Invoke-PublicConfigValidation -Path $configPath
+
+            Assert-Equal -Expected 2 -Actual $validation.exitCode -Message ('Fallback case returned the wrong exit code: {0}' -f $case.name)
+            Assert-Equal -Expected $case.expectedCode -Actual $validation.result.errors[0].code -Message ('Fallback case returned the wrong code: {0}' -f $case.name)
+            Assert-Equal -Expected $case.expectedPath -Actual $validation.result.errors[0].path -Message ('Fallback case returned the wrong path: {0}' -f $case.name)
         }
     }
 
