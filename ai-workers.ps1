@@ -566,6 +566,8 @@ function Invoke-NativeWorker {
         [ValidateRange(1, 3600)]
         [int]$ProcessTimeoutSeconds,
 
+        [int]$ProcessTimeoutMilliseconds = 0,
+
         [AllowNull()]
         [string]$StandardInputText,
 
@@ -596,7 +598,12 @@ function Invoke-NativeWorker {
 
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($ProcessTimeoutSeconds * 1000)) {
+        $effectiveTimeoutMilliseconds = if ($ProcessTimeoutMilliseconds -gt 0) {
+            $ProcessTimeoutMilliseconds
+        } else {
+            $ProcessTimeoutSeconds * 1000
+        }
+        if (-not $process.WaitForExit($effectiveTimeoutMilliseconds)) {
             $timedOut = $true
             $terminationSucceeded = Stop-WorkerProcessTree -Process $process
         } else {
@@ -1123,6 +1130,79 @@ function Invoke-MiniMaxQuota {
     }
 }
 
+function Remove-AiwPlannedTemporaryDirectory {
+    param([Parameter(Mandatory)][object]$Plan)
+
+    $property = $Plan.PSObject.Properties['temporaryDirectory']
+    if ($null -ne $property -and
+        -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+        Remove-AiwTemporaryDirectory -Path ([string]$property.Value)
+    }
+}
+
+function Invoke-AiwPlannedWorker {
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds
+    )
+
+    $environmentPreviousValues = @{}
+    try {
+        foreach ($property in $Plan.environmentOverlay.PSObject.Properties) {
+            $environmentPreviousValues[$property.Name] = [Environment]::GetEnvironmentVariable($property.Name)
+            Set-Item -LiteralPath ('Env:{0}' -f $property.Name) -Value ([string]$property.Value)
+        }
+        return Invoke-NativeWorker `
+            -FilePath $Plan.filePath `
+            -Arguments @($Plan.arguments) `
+            -Directory $Plan.workingDirectory `
+            -ProcessTimeoutSeconds $TimeoutSeconds `
+            -ProcessTimeoutMilliseconds $TimeoutMilliseconds `
+            -StandardInputText $Plan.standardInputText `
+            -AllowBatchWorker:$Plan.allowBatchWorker
+    } finally {
+        foreach ($name in $environmentPreviousValues.Keys) {
+            Restore-EnvironmentVariable -Name $name -PreviousValue $environmentPreviousValues[$name]
+        }
+        Remove-AiwPlannedTemporaryDirectory -Plan $Plan
+    }
+}
+
+function Test-AiwFallbackAllowed {
+    param(
+        [Parameter(Mandatory)][object]$Policy,
+        [Parameter(Mandatory)][object]$Request,
+        [Parameter(Mandatory)][object]$NativeResult,
+        [Parameter(Mandatory)][string]$FailureKind,
+        [Parameter(Mandatory)][int]$AttemptCount,
+        [Parameter(Mandatory)][int64]$RemainingMilliseconds
+    )
+
+    if ($Policy.selectorKind -eq 'worker' -or
+        [bool]$Request.noFallback -or
+        [string]$Request.mode -eq 'write' -or
+        $AttemptCount -ge [int]$Policy.maxAttempts -or
+        $RemainingMilliseconds -le 0) {
+        return $false
+    }
+    if (@(
+        'permission_denied',
+        'config_invalid',
+        'capability_denied',
+        'launcher_unsafe',
+        'wrapper_error',
+        'policy_denied',
+        'stream_drain_timeout'
+    ) -contains $FailureKind) {
+        return $false
+    }
+    if ($FailureKind -eq 'timeout' -and -not [bool]$NativeResult.TerminationSucceeded) {
+        return $false
+    }
+    return @($Policy.on) -contains $FailureKind
+}
+
 if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config', 'run')) {
     try {
         $coreRequest = if ($Command -eq 'catalog') {
@@ -1157,37 +1237,99 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
                 noFallback = [bool]$NoFallback
             }
         }
+        $runStopwatch = if ($Command -eq 'run') {
+            [System.Diagnostics.Stopwatch]::StartNew()
+        } else {
+            $null
+        }
         $coreResult = Invoke-AiwCore -Request $coreRequest
         if ($Command -eq 'run' -and $coreResult.ok) {
-            $environmentPreviousValues = @{}
-            $temporaryDirectoryProperty = $coreResult.plan.PSObject.Properties['temporaryDirectory']
-            $temporaryDirectory = if ($null -eq $temporaryDirectoryProperty) {
-                $null
-            } else {
-                [string]$temporaryDirectoryProperty.Value
+            $totalTimeoutMilliseconds = [int64]$TimeoutSeconds * 1000
+            $attempts = @()
+            $allSkipped = @($coreResult.skipped)
+            $excludedWorkers = @()
+            $currentCoreResult = $coreResult
+            $nativeResult = $null
+            $failureKind = $null
+            while ($attempts.Count -lt [int]$coreResult.fallbackPolicy.maxAttempts) {
+                $remainingMilliseconds = $totalTimeoutMilliseconds - $runStopwatch.ElapsedMilliseconds
+                if ($remainingMilliseconds -le 0) {
+                    Remove-AiwPlannedTemporaryDirectory -Plan $currentCoreResult.plan
+                    break
+                }
+                $boundedRemainingMilliseconds = [int][Math]::Min(
+                    [int]::MaxValue,
+                    $remainingMilliseconds
+                )
+                $nativeResult = Invoke-AiwPlannedWorker `
+                    -Plan $currentCoreResult.plan `
+                    -TimeoutSeconds $TimeoutSeconds `
+                    -TimeoutMilliseconds $boundedRemainingMilliseconds
+                $failureKind = Get-WorkerFailureKind -Result $nativeResult
+                $attempts += [pscustomobject]@{
+                    worker = $currentCoreResult.selection.worker
+                    adapter = $currentCoreResult.selection.adapter
+                    model = $currentCoreResult.selection.model
+                    childExitCode = $nativeResult.ExitCode
+                    failureKind = $failureKind
+                    timedOut = $nativeResult.TimedOut
+                    readTimedOut = $nativeResult.ReadTimedOut
+                    durationMs = $nativeResult.DurationMs
+                    diagnostics = Get-SanitizedDiagnostics -Text ([string]$nativeResult.StandardError)
+                }
+                if ($nativeResult.ExitCode -eq 0) {
+                    break
+                }
+
+                $remainingMilliseconds = $totalTimeoutMilliseconds - $runStopwatch.ElapsedMilliseconds
+                if (-not (Test-AiwFallbackAllowed `
+                    -Policy $coreResult.fallbackPolicy `
+                    -Request $coreRequest `
+                    -NativeResult $nativeResult `
+                    -FailureKind $failureKind `
+                    -AttemptCount $attempts.Count `
+                    -RemainingMilliseconds $remainingMilliseconds)) {
+                    break
+                }
+
+                $excludedWorkers += [string]$currentCoreResult.selection.worker
+                $coreRequest | Add-Member `
+                    -MemberType NoteProperty `
+                    -Name excludedWorkers `
+                    -Value @($excludedWorkers) `
+                    -Force
+                $nextCoreResult = Invoke-AiwCore -Request $coreRequest
+                if (-not $nextCoreResult.ok) {
+                    break
+                }
+                foreach ($skip in @($nextCoreResult.skipped)) {
+                    $alreadyReported = @(
+                        $allSkipped |
+                            Where-Object {
+                                $_.worker -eq $skip.worker -and
+                                $_.reason -eq $skip.reason
+                            }
+                    ).Count -gt 0
+                    if (-not $alreadyReported) {
+                        $allSkipped += $skip
+                    }
+                }
+                $currentCoreResult = $nextCoreResult
             }
-            try {
-                foreach ($property in $coreResult.plan.environmentOverlay.PSObject.Properties) {
-                    $environmentPreviousValues[$property.Name] = [Environment]::GetEnvironmentVariable($property.Name)
-                    Set-Item -LiteralPath ('Env:{0}' -f $property.Name) -Value ([string]$property.Value)
+            $runStopwatch.Stop()
+            if ($null -eq $nativeResult) {
+                $nativeResult = [pscustomobject]@{
+                    ExitCode = 124
+                    StandardOutput = ''
+                    StandardError = ''
+                    TimedOut = $true
+                    ReadTimedOut = $false
+                    DurationMs = [int64]$runStopwatch.ElapsedMilliseconds
+                    TerminationSucceeded = $true
                 }
-                $nativeResult = Invoke-NativeWorker `
-                    -FilePath $coreResult.plan.filePath `
-                    -Arguments @($coreResult.plan.arguments) `
-                    -Directory $coreResult.plan.workingDirectory `
-                    -ProcessTimeoutSeconds $TimeoutSeconds `
-                    -StandardInputText $coreResult.plan.standardInputText `
-                    -AllowBatchWorker:$coreResult.plan.allowBatchWorker
-            } finally {
-                foreach ($name in $environmentPreviousValues.Keys) {
-                    Restore-EnvironmentVariable -Name $name -PreviousValue $environmentPreviousValues[$name]
-                }
-                if (-not [string]::IsNullOrWhiteSpace($temporaryDirectory)) {
-                    Remove-AiwTemporaryDirectory -Path $temporaryDirectory
-                }
+                $failureKind = 'timeout'
             }
 
-            $failureKind = Get-WorkerFailureKind -Result $nativeResult
             $publicExitCode = if ($nativeResult.ExitCode -eq 0) {
                 0
             } elseif ($nativeResult.TimedOut) {
@@ -1202,26 +1344,15 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
                 ok = ($nativeResult.ExitCode -eq 0)
                 command = 'run'
                 request = $coreResult.request
-                selection = $coreResult.selection
+                selection = $currentCoreResult.selection
                 exitCode = $publicExitCode
                 timedOut = $nativeResult.TimedOut
                 readTimedOut = $nativeResult.ReadTimedOut
                 terminationSucceeded = $nativeResult.TerminationSucceeded
-                durationMs = $nativeResult.DurationMs
+                durationMs = [int64]$runStopwatch.ElapsedMilliseconds
                 failureKind = $failureKind
-                skipped = @($coreResult.skipped)
-                attempts = @(
-                    [pscustomobject]@{
-                        worker = $coreResult.selection.worker
-                        adapter = $coreResult.selection.adapter
-                        model = $coreResult.selection.model
-                        childExitCode = $nativeResult.ExitCode
-                        failureKind = $failureKind
-                        timedOut = $nativeResult.TimedOut
-                        readTimedOut = $nativeResult.ReadTimedOut
-                        durationMs = $nativeResult.DurationMs
-                    }
-                )
+                skipped = @($allSkipped)
+                attempts = @($attempts)
                 output = Convert-OutputValue -Text ([string]$nativeResult.StandardOutput)
                 error = if ($nativeResult.ExitCode -eq 0) {
                     $null

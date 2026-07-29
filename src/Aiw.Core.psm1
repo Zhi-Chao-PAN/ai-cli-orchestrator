@@ -973,6 +973,7 @@ function New-AiwRunPlan {
     }
 
     $candidateWorkerIds = @()
+    $profileDefinition = $null
     if (-not [string]::IsNullOrWhiteSpace($selectedProfileId)) {
         $profileProperty = $loaded.document.profiles.PSObject.Properties[$selectedProfileId]
         if ($null -eq $profileProperty) {
@@ -982,9 +983,40 @@ function New-AiwRunPlan {
                 -FailureKind 'selection_required' `
                 -Message 'Selected profile was not found.'
         }
-        $candidateWorkerIds = @($profileProperty.Value.workers)
+        $profileDefinition = $profileProperty.Value
+        $candidateWorkerIds = @($profileDefinition.workers)
     } elseif (-not [string]::IsNullOrWhiteSpace($selectedWorkerId)) {
         $candidateWorkerIds = @($selectedWorkerId)
+    }
+
+    $selectorKind = if (-not [string]::IsNullOrWhiteSpace($selectedRouteId)) {
+        'route'
+    } elseif (-not [string]::IsNullOrWhiteSpace($selectedProfileId)) {
+        'profile'
+    } else {
+        'worker'
+    }
+    $fallbackMaxAttempts = 1
+    $fallbackFailureKinds = @()
+    if ($null -ne $profileDefinition) {
+        $fallbackProperty = $profileDefinition.PSObject.Properties['fallback']
+        if ($null -ne $fallbackProperty -and $null -ne $fallbackProperty.Value) {
+            $maxAttemptsProperty = $fallbackProperty.Value.PSObject.Properties['maxAttempts']
+            if ($null -ne $maxAttemptsProperty) {
+                $fallbackMaxAttempts = [int]$maxAttemptsProperty.Value
+            }
+            $onProperty = $fallbackProperty.Value.PSObject.Properties['on']
+            if ($null -ne $onProperty -and $null -ne $onProperty.Value) {
+                $fallbackFailureKinds = @($onProperty.Value)
+            }
+        }
+    }
+    $excludedWorkersProperty = $Request.PSObject.Properties['excludedWorkers']
+    $excludedWorkers = if ($null -eq $excludedWorkersProperty -or
+        $null -eq $excludedWorkersProperty.Value) {
+        @()
+    } else {
+        @($excludedWorkersProperty.Value)
     }
 
     $requiredCapabilities = @('text.reason') + @($Request.requiredCapabilities) + @($routeCapabilities)
@@ -997,6 +1029,9 @@ function New-AiwRunPlan {
     $adapter = $null
     $filePath = $null
     foreach ($candidateWorkerId in $candidateWorkerIds) {
+        if ($excludedWorkers -contains [string]$candidateWorkerId) {
+            continue
+        }
         $workerProperty = $loaded.document.workers.PSObject.Properties[[string]$candidateWorkerId]
         if ($null -eq $workerProperty) {
             $skipped += [pscustomobject]@{ worker = [string]$candidateWorkerId; reason = 'not_found' }
@@ -1173,6 +1208,11 @@ function New-AiwRunPlan {
             worker = $selectedWorkerId
             adapter = $adapter.id
             model = $model
+        }
+        fallbackPolicy = [pscustomobject]@{
+            selectorKind = $selectorKind
+            maxAttempts = $fallbackMaxAttempts
+            on = @($fallbackFailureKinds)
         }
         plan = [pscustomobject]@{
             filePath = $filePath

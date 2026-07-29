@@ -1194,6 +1194,209 @@ try {
         Assert-Equal -Expected 'disabled' -Actual $run.skipped[0].reason -Message 'Profile skip reason changed'
     }
 
+    Invoke-Test -Name 'Read profile falls back in order only for an explicitly allowed failure kind' -Body {
+        $firstDirectory = Join-Path $tempRoot 'fallback-first'
+        $secondDirectory = Join-Path $tempRoot 'fallback-second'
+        [void](New-Item -ItemType Directory -Path $firstDirectory)
+        [void](New-Item -ItemType Directory -Path $secondDirectory)
+        $firstWorkerPath = Join-Path $firstDirectory 'claude.ps1'
+        $secondWorkerPath = Join-Path $secondDirectory 'claude.ps1'
+        $firstMarker = Join-Path $tempRoot 'fallback-first.marker'
+        $secondMarker = Join-Path $tempRoot 'fallback-second.marker'
+        $configPath = Join-Path $tempRoot 'run-fallback-v2.json'
+        $promptPath = Join-Path $tempRoot 'run-fallback-prompt.md'
+        [System.IO.File]::WriteAllText(
+            $firstWorkerPath,
+            ('[System.IO.File]::WriteAllText(''{0}'', ''started''); [Console]::Error.Write(''fixture process failure''); exit 9' -f $firstMarker.Replace("'", "''")),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        [System.IO.File]::WriteAllText(
+            $secondWorkerPath,
+            ('[System.IO.File]::WriteAllText(''{0}'', ''started''); [Console]::Write(''FALLBACK_OK'')' -f $secondMarker.Replace("'", "''")),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        [System.IO.File]::WriteAllText($promptPath, 'fallback task')
+        $runConfig = [ordered]@{
+            schemaVersion = 2
+            defaultRoute = $null
+            defaultProfile = $null
+            workers = [ordered]@{
+                first = [ordered]@{
+                    adapter = 'claude-code/v1'
+                    enabled = $true
+                    path = $firstWorkerPath
+                    model = 'first-model'
+                    capabilities = @('text.reason')
+                    settings = [ordered]@{}
+                }
+                second = [ordered]@{
+                    adapter = 'claude-code/v1'
+                    enabled = $true
+                    path = $secondWorkerPath
+                    model = 'second-model'
+                    capabilities = @('text.reason')
+                    settings = [ordered]@{}
+                }
+            }
+            profiles = [ordered]@{
+                resilient = [ordered]@{
+                    workers = @('first', 'second')
+                    fallback = [ordered]@{
+                        maxAttempts = 2
+                        on = @('process_exit')
+                    }
+                }
+            }
+            routes = [ordered]@{}
+        }
+        Write-TestJson -Path $configPath -Value $runConfig
+
+        $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+        $hostPath = Get-CurrentPowerShellExecutable
+        $runOutput = & $hostPath `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -File $launcherPath `
+            run `
+            -Profile 'resilient' `
+            -PromptFile $promptPath `
+            -Mode read `
+            -WorkingDirectory $tempRoot `
+            -ConfigPath $configPath `
+            -TimeoutSeconds 30 `
+            -Json
+        $runExitCode = $LASTEXITCODE
+        $run = (@($runOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+        Assert-Equal -Expected 0 -Actual $runExitCode -Message 'Allowed read fallback returned a non-zero exit code'
+        Assert-True -Condition $run.ok -Message 'Allowed read fallback failed'
+        Assert-Equal -Expected 'second' -Actual $run.selection.worker -Message 'Fallback did not select the second worker'
+        Assert-Equal -Expected 'second-model' -Actual $run.selection.model -Message 'Fallback final model changed'
+        Assert-Equal -Expected 'FALLBACK_OK' -Actual $run.output -Message 'Fallback final output changed'
+        Assert-Equal -Expected 2 -Actual @($run.attempts).Count -Message 'Fallback attempt count changed'
+        Assert-Equal -Expected 'first' -Actual $run.attempts[0].worker -Message 'Fallback first attempt changed'
+        Assert-Equal -Expected 'process_exit' -Actual $run.attempts[0].failureKind -Message 'Fallback first failure kind changed'
+        Assert-Equal -Expected 'second' -Actual $run.attempts[1].worker -Message 'Fallback second attempt changed'
+        Assert-True -Condition (Test-Path -LiteralPath $firstMarker) -Message 'Fallback first worker did not start'
+        Assert-True -Condition (Test-Path -LiteralPath $secondMarker) -Message 'Fallback second worker did not start'
+    }
+
+    Invoke-Test -Name 'Fallback hard stops on permission denial write mode and NoFallback' -Body {
+        $cases = @(
+            [pscustomobject]@{
+                name = 'permission'
+                mode = 'read'
+                noFallback = $false
+                errorText = 'headless mode cannot prompt; permission denied'
+                expectedFailureKind = 'permission_denied'
+            },
+            [pscustomobject]@{
+                name = 'write'
+                mode = 'write'
+                noFallback = $false
+                errorText = 'fixture process failure'
+                expectedFailureKind = 'process_exit'
+            },
+            [pscustomobject]@{
+                name = 'no-fallback'
+                mode = 'read'
+                noFallback = $true
+                errorText = 'fixture process failure'
+                expectedFailureKind = 'process_exit'
+            }
+        )
+
+        foreach ($case in $cases) {
+            $caseRoot = Join-Path $tempRoot ('hard-stop-{0}' -f $case.name)
+            $firstDirectory = Join-Path $caseRoot 'first'
+            $secondDirectory = Join-Path $caseRoot 'second'
+            [void](New-Item -ItemType Directory -Path $firstDirectory -Force)
+            [void](New-Item -ItemType Directory -Path $secondDirectory -Force)
+            $firstWorkerPath = Join-Path $firstDirectory 'claude.ps1'
+            $secondWorkerPath = Join-Path $secondDirectory 'claude.ps1'
+            $firstMarker = Join-Path $caseRoot 'first.marker'
+            $secondMarker = Join-Path $caseRoot 'second.marker'
+            $configPath = Join-Path $caseRoot 'config.json'
+            $promptPath = Join-Path $caseRoot 'prompt.md'
+            [System.IO.File]::WriteAllText(
+                $firstWorkerPath,
+                ('[System.IO.File]::WriteAllText(''{0}'', ''started''); [Console]::Error.Write(''{1}''); exit 9' -f $firstMarker.Replace("'", "''"), $case.errorText.Replace("'", "''")),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            [System.IO.File]::WriteAllText(
+                $secondWorkerPath,
+                ('[System.IO.File]::WriteAllText(''{0}'', ''started''); [Console]::Write(''SHOULD_NOT_RUN'')' -f $secondMarker.Replace("'", "''")),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            [System.IO.File]::WriteAllText($promptPath, 'hard stop task')
+            $runConfig = [ordered]@{
+                schemaVersion = 2
+                defaultRoute = $null
+                defaultProfile = $null
+                workers = [ordered]@{
+                    first = [ordered]@{
+                        adapter = 'claude-code/v1'
+                        enabled = $true
+                        path = $firstWorkerPath
+                        model = 'first-model'
+                        capabilities = @('text.reason', 'workspace.write')
+                        settings = [ordered]@{}
+                    }
+                    second = [ordered]@{
+                        adapter = 'claude-code/v1'
+                        enabled = $true
+                        path = $secondWorkerPath
+                        model = 'second-model'
+                        capabilities = @('text.reason', 'workspace.write')
+                        settings = [ordered]@{}
+                    }
+                }
+                profiles = [ordered]@{
+                    guarded = [ordered]@{
+                        workers = @('first', 'second')
+                        fallback = [ordered]@{
+                            maxAttempts = 2
+                            on = @('process_exit')
+                        }
+                    }
+                }
+                routes = [ordered]@{}
+            }
+            Write-TestJson -Path $configPath -Value $runConfig
+
+            $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+            $hostPath = Get-CurrentPowerShellExecutable
+            $arguments = @(
+                '-NoLogo',
+                '-NoProfile',
+                '-NonInteractive',
+                '-File', $launcherPath,
+                'run',
+                '-Profile', 'guarded',
+                '-PromptFile', $promptPath,
+                '-Mode', $case.mode,
+                '-WorkingDirectory', $caseRoot,
+                '-ConfigPath', $configPath,
+                '-TimeoutSeconds', '30',
+                '-Json'
+            )
+            if ($case.noFallback) {
+                $arguments += '-NoFallback'
+            }
+            $runOutput = & $hostPath @arguments
+            $runExitCode = $LASTEXITCODE
+            $run = (@($runOutput) -join [Environment]::NewLine) | ConvertFrom-Json
+
+            Assert-Equal -Expected 1 -Actual $runExitCode -Message ('Fallback hard-stop returned the wrong exit code: {0}' -f $case.name)
+            Assert-True -Condition (-not $run.ok) -Message ('Fallback hard-stop unexpectedly succeeded: {0}' -f $case.name)
+            Assert-Equal -Expected 1 -Actual @($run.attempts).Count -Message ('Fallback hard-stop attempt count changed: {0}' -f $case.name)
+            Assert-Equal -Expected $case.expectedFailureKind -Actual $run.failureKind -Message ('Fallback hard-stop failure kind changed: {0}' -f $case.name)
+            Assert-True -Condition (Test-Path -LiteralPath $firstMarker) -Message ('Fallback hard-stop first worker did not start: {0}' -f $case.name)
+            Assert-True -Condition (-not (Test-Path -LiteralPath $secondMarker)) -Message ('Fallback hard-stop launched a second worker: {0}' -f $case.name)
+        }
+    }
+
     Invoke-Test -Name 'Run route capabilities take priority over worker order' -Body {
         $miniMaxPath = Join-Path $tempRoot 'mmx.ps1'
         $claudePath = Join-Path $tempRoot 'claude.ps1'
