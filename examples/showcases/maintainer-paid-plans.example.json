@@ -1,0 +1,134 @@
+{
+  "schemaVersion": 2,
+  "defaultRoute": null,
+  "defaultProfile": null,
+  "workers": {
+    "showcase-google": {
+      "adapter": "antigravity/v1",
+      "enabled": true,
+      "path": null,
+      "model": "gemini-3.6-flash-high",
+      "capabilities": [
+        "text.reason",
+        "context.long",
+        "workspace.read",
+        "workspace.write"
+      ],
+      "settings": {}
+    },
+    "showcase-minimax": {
+      "adapter": "minimax-cli/v1",
+      "enabled": true,
+      "path": null,
+      "model": "MiniMax-M3",
+      "capabilities": [
+        "text.reason",
+        "quota.read"
+      ],
+      "settings": {
+        "region": "cn",
+        "configDirectory": "%USERPROFILE%\\.mmx"
+      }
+    },
+    "showcase-ark-coding-glm": {
+      "adapter": "claude-code/v1",
+      "enabled": true,
+      "path": null,
+      "model": "glm-5.2",
+      "capabilities": [
+        "text.reason",
+        "workspace.read",
+        "workspace.write"
+      ],
+      "settings": {
+        "configDirectory": "%USERPROFILE%\\.claude"
+      }
+    },
+    "showcase-ark-coding-kimi": {
+      "adapter": "claude-code/v1",
+      "enabled": true,
+      "path": null,
+      "model": "kimi-k2.7-code",
+      "capabilities": [
+        "text.reason",
+        "workspace.read",
+        "workspace.write"
+      ],
+      "settings": {
+        "configDirectory": "%USERPROFILE%\\.claude"
+      }
+    },
+    "showcase-ark-agent": {
+      "adapter": "claude-code/v1",
+      "enabled": true,
+      "path": null,
+      "model": "ark-code-latest",
+      "capabilities": [
+        "text.reason",
+        "workspace.read",
+        "workspace.write"
+      ],
+      "settings": {
+        "configDirectory": "%USERPROFILE%\\.claude-agent-plan"
+      }
+    },
+    "showcase-deepseek-metered": {
+      "adapter": "claude-code/v1",
+      "enabled": true,
+      "path": null,
+      "model": null,
+      "capabilities": [
+        "text.reason",
+        "workspace.read",
+        "workspace.write"
+      ],
+      "settings": {
+        "configDirectory": "%USERPROFILE%\\.claude-deepseek-metered"
+      }
+    }
+  },
+  "profiles": {
+    "showcase-paid-first": {
+      "workers": [
+        "showcase-google",
+        "showcase-minimax",
+        "showcase-ark-coding-glm",
+        "showcase-ark-coding-kimi",
+        "showcase-ark-agent",
+        "showcase-deepseek-metered"
+      ],
+      "fallback": {
+        "maxAttempts": 6,
+        "on": [
+          "authentication",
+          "quota_or_rate_limit",
+          "process_exit"
+        ]
+      }
+    }
+  },
+  "routes": {
+    "showcase-stateless-reasoning": {
+      "profile": "showcase-paid-first",
+      "requiredCapabilities": [
+        "text.reason"
+      ],
+      "defaultMode": "read",
+      "allowedModes": [
+        "read"
+      ]
+    },
+    "showcase-repository": {
+      "profile": "showcase-paid-first",
+      "requiredCapabilities": [
+        "text.reason",
+        "workspace.read"
+      ],
+      "defaultMode": "read",
+      "allowedModes": [
+        "read",
+        "write"
+      ]
+    }
+  }
+}

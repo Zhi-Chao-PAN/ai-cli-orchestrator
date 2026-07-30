@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 2,
+  "defaultRoute": null,
+  "defaultProfile": null,
+  "workers": {
+    "claude-local": {
+      "adapter": "claude-code/v1",
+      "enabled": true,
+      "path": null,
+      "model": null,
+      "capabilities": [
+        "text.reason",
+        "workspace.read",
+        "workspace.write"
+      ],
+      "settings": {}
+    },
+    "antigravity-local": {
+      "adapter": "antigravity/v1",
+      "enabled": true,
+      "path": null,
+      "model": null,
+      "capabilities": [
+        "text.reason",
+        "context.long",
+        "workspace.read",
+        "workspace.write"
+      ],
+      "settings": {}
+    },
+    "minimax-local": {
+      "adapter": "minimax-cli/v1",
+      "enabled": true,
+      "path": null,
+      "model": "replace-with-supported-model",
+      "capabilities": [
+        "text.reason",
+        "quota.read"
+      ],
+      "settings": {
+        "region": "cn"
+      }
+    }
+  },
+  "profiles": {
+    "claude-only": {
+      "workers": [
+        "claude-local"
+      ],
+      "fallback": {
+        "maxAttempts": 1,
+        "on": []
+      }
+    },
+    "antigravity-only": {
+      "workers": [
+        "antigravity-local"
+      ],
+      "fallback": {
+        "maxAttempts": 1,
+        "on": []
+      }
+    },
+    "minimax-only": {
+      "workers": [
+        "minimax-local"
+      ],
+      "fallback": {
+        "maxAttempts": 1,
+        "on": []
+      }
+    }
+  },
+  "routes": {
+    "claude-repository": {
+      "profile": "claude-only",
+      "requiredCapabilities": [
+        "text.reason",
+        "workspace.read"
+      ],
+      "defaultMode": "read",
+      "allowedModes": [
+        "read",
+        "write"
+      ]
+    },
+    "antigravity-repository": {
+      "profile": "antigravity-only",
+      "requiredCapabilities": [
+        "text.reason",
+        "workspace.read"
+      ],
+      "defaultMode": "read",
+      "allowedModes": [
+        "read",
+        "write"
+      ]
+    },
+    "minimax-reasoning": {
+      "profile": "minimax-only",
+      "requiredCapabilities": [
+        "text.reason"
+      ],
+      "defaultMode": "read",
+      "allowedModes": [
+        "read"
+      ]
+    }
+  }
+}

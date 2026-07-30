@@ -8,6 +8,11 @@ $orchestratorRoot = Split-Path -Parent $PSScriptRoot
 $installScriptPath = Join-Path $orchestratorRoot 'install.ps1'
 $uninstallScriptPath = Join-Path $orchestratorRoot 'uninstall.ps1'
 $sourceLauncherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
+$versionMetadata = Get-Content -LiteralPath (Join-Path $orchestratorRoot 'version.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$script:ExpectedProductVersion = [string]$versionMetadata.productVersion
+if ($script:ExpectedProductVersion -cne '0.3.0') {
+    throw 'The release contract expects version 0.3.0.'
+}
 $script:Passed = 0
 
 function Assert-Equal {
@@ -64,6 +69,7 @@ function Assert-ValidAiwMarker {
     $marker = (Get-Content -LiteralPath $Path -Raw) | ConvertFrom-Json
     Assert-Equal -Expected 'aiw' -Actual ([string]$marker.product) -Message 'Marker product changed'
     Assert-Equal -Expected 1 -Actual ([int]$marker.schemaVersion) -Message 'Marker schema changed'
+    Assert-Equal -Expected $script:ExpectedProductVersion -Actual ([string]$marker.productVersion) -Message 'Marker product version changed'
 }
 
 function Get-CurrentPowerShellExecutable {
@@ -87,6 +93,18 @@ function Invoke-LauncherCatalog {
 
     $hostPath = Get-CurrentPowerShellExecutable
     $output = @(& $hostPath -NoLogo -NoProfile -NonInteractive -File $LauncherPath catalog -Json)
+    $exitCode = $LASTEXITCODE
+    return [pscustomobject]@{
+        exitCode = $exitCode
+        text = ($output -join [Environment]::NewLine)
+    }
+}
+
+function Invoke-LauncherDoctorV2 {
+    param([Parameter(Mandatory)][string]$LauncherPath)
+
+    $hostPath = Get-CurrentPowerShellExecutable
+    $output = @(& $hostPath -NoLogo -NoProfile -NonInteractive -File $LauncherPath doctor -OutputSchema 2 -Json)
     $exitCode = $LASTEXITCODE
     return [pscustomobject]@{
         exitCode = $exitCode
@@ -142,10 +160,16 @@ try {
         Invoke-InIsolatedUserRoot -Root $testRoot -Body {
             param($profileRoot, $localAppDataRoot)
 
-            & $installScriptPath | Out-Null
+            $installOutput = @(& $installScriptPath)
             $installRoot = Join-Path $localAppDataRoot 'aiw'
             Assert-True -Condition (Test-Path -LiteralPath (Join-Path $installRoot 'app\ai-workers.ps1') -PathType Leaf) -Message 'Application was not installed'
             Assert-ValidAiwMarker -Path (Join-Path $installRoot 'app\.aiw-install.json')
+            Assert-True -Condition ((@($installOutput) -join [Environment]::NewLine) -match 'doctor -OutputSchema 2 -Json') -Message 'Installer did not print the provider-neutral verification command'
+            $doctorResult = Invoke-LauncherDoctorV2 -LauncherPath (Join-Path $installRoot 'bin\aiw.ps1')
+            $doctor = $doctorResult.text | ConvertFrom-Json
+            Assert-Equal -Expected 0 -Actual $doctorResult.exitCode -Message 'Printed v2 doctor command failed after installation'
+            Assert-Equal -Expected 2 -Actual ([int]$doctor.schemaVersion) -Message 'Installed doctor schema changed'
+            Assert-Equal -Expected $script:ExpectedProductVersion -Actual ([string]$doctor.productVersion) -Message 'Installed doctor product version changed'
             Assert-True -Condition (-not (Test-Path -LiteralPath (Join-Path $profileRoot '.aiw'))) -Message 'Fresh install created a user configuration directory'
         }
     }
@@ -158,12 +182,14 @@ try {
             $sourceResult = Invoke-LauncherCatalog -LauncherPath $sourceLauncherPath
             Assert-Equal -Expected 0 -Actual $sourceResult.exitCode -Message 'Source-layout launcher failed'
             Assert-True -Condition ($sourceResult.text -match '"command"\s*:\s*"catalog"') -Message 'Source launcher did not invoke the catalog command'
+            Assert-Equal -Expected $script:ExpectedProductVersion -Actual ([string](($sourceResult.text | ConvertFrom-Json).productVersion)) -Message 'Source catalog product version changed'
 
             & $installScriptPath | Out-Null
             $installedLauncher = Join-Path $localAppDataRoot 'aiw\bin\aiw.ps1'
             $installedResult = Invoke-LauncherCatalog -LauncherPath $installedLauncher
             Assert-Equal -Expected 0 -Actual $installedResult.exitCode -Message 'Installed-layout launcher failed'
             Assert-True -Condition ($installedResult.text -match '"command"\s*:\s*"catalog"') -Message 'Installed launcher did not invoke the catalog command'
+            Assert-Equal -Expected $script:ExpectedProductVersion -Actual ([string](($installedResult.text | ConvertFrom-Json).productVersion)) -Message 'Installed catalog product version changed'
         }
     }
 

@@ -42,6 +42,9 @@ param(
 
     [switch]$NoFallback,
 
+    [ValidateSet(1, 2)]
+    [int]$OutputSchema = 1,
+
     [switch]$Json
 )
 
@@ -51,7 +54,21 @@ $ErrorActionPreference = 'Stop'
 $script:AiwCoreModulePath = Join-Path $PSScriptRoot 'src\Aiw.Core.psm1'
 Import-Module -Name $script:AiwCoreModulePath -Force -ErrorAction Stop
 
-$script:AiwVersion = '0.2.0'
+$script:AiwVersionPath = Join-Path $PSScriptRoot 'version.json'
+try {
+    $versionDocument = [System.IO.File]::ReadAllText($script:AiwVersionPath) | ConvertFrom-Json
+    $versionProperty = $versionDocument.PSObject.Properties['productVersion']
+    if ($null -eq $versionProperty) {
+        throw 'Missing productVersion.'
+    }
+    $script:AiwVersion = ([string]$versionProperty.Value).Trim()
+    if ($script:AiwVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
+        throw 'Invalid productVersion.'
+    }
+} catch {
+    throw 'AIW version metadata is missing or invalid.'
+}
+$script:MaxWorkerStreamBytes = 16777216
 $script:WorkerConfig = $null
 $script:ConfigPathResolved = $null
 $script:ResolvedWorkerPaths = @{}
@@ -124,6 +141,21 @@ function Resolve-AiwConfigPath {
         throw ('Configuration file does not exist: {0}' -f $requestedPath)
     }
     return (Resolve-Path -LiteralPath $requestedPath).Path
+}
+
+function Resolve-AiwCoreConfigPath {
+    if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+        return [System.IO.Path]::GetFullPath($ConfigPath)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:AIW_CONFIG_PATH)) {
+        return [System.IO.Path]::GetFullPath($env:AIW_CONFIG_PATH)
+    }
+
+    $candidate = Join-Path $env:USERPROFILE '.aiw\config.json'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+        return (Resolve-Path -LiteralPath $candidate).Path
+    }
+    return $null
 }
 
 function Get-FirstExistingPath {
@@ -375,7 +407,10 @@ function Convert-OutputValue {
 }
 
 function Get-SanitizedDiagnostics {
-    param([AllowNull()][string]$Text)
+    param(
+        [AllowNull()][string]$Text,
+        [AllowNull()][string]$PromptText
+    )
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
         return $null
@@ -385,13 +420,42 @@ function Get-SanitizedDiagnostics {
     $sanitized = $sanitized -replace '(?i)(Bearer\s+)[A-Za-z0-9._-]+', '$1[REDACTED]'
     $sanitized = $sanitized -replace '(?i)\bsk-[A-Za-z0-9_-]{8,}\b', '[REDACTED]'
     $sanitized = $sanitized -replace '(?i)\b(API[_-]?KEY|AUTHORIZATION|AUTH[_-]?TOKEN|TOKEN)\s*([:=])\s*\S+', '$1$2[REDACTED]'
+    if (-not [string]::IsNullOrWhiteSpace($PromptText)) {
+        $sanitized = $sanitized.Replace($PromptText, '[REDACTED_WORK_ORDER]')
+    }
     return $sanitized.TrimEnd()
 }
 
-function ConvertTo-NativeArgument {
-    param([AllowEmptyString()][string]$Value)
+function Get-PublicWorkerDiagnostics {
+    param([Parameter(Mandatory)][object]$Result)
 
-    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+    $trustedOverride = [string](Get-AiwProperty `
+        -Object $Result `
+        -Name 'PublicDiagnosticsOverride' `
+        -DefaultValue '')
+    if (-not [string]::IsNullOrWhiteSpace($trustedOverride)) {
+        return $trustedOverride
+    }
+
+    $standardError = [string](Get-AiwProperty -Object $Result -Name 'StandardError' -DefaultValue '')
+    if ([string]::IsNullOrWhiteSpace($standardError)) {
+        return $null
+    }
+
+    # Provider stderr is untrusted: it can contain work-order text, secrets, or
+    # terminal formatting. FailureKind remains the structured diagnostic signal.
+    return 'Worker diagnostic output was withheld from the public result.'
+}
+
+function ConvertTo-NativeArgument {
+    param(
+        [AllowEmptyString()][string]$Value,
+        [switch]$AlwaysQuote
+    )
+
+    if (-not $AlwaysQuote -and
+        $Value.Length -gt 0 -and
+        $Value -notmatch '[\s"]') {
         return $Value
     }
 
@@ -426,12 +490,23 @@ function ConvertTo-NativeArgument {
     return $builder.ToString()
 }
 
+function ConvertTo-ReviewedCmdToken {
+    param([AllowEmptyString()][string]$Value)
+
+    if ($Value -match '[\x00-\x1F\x7F"&|<>^%!]') {
+        throw 'MiniMax batch argument contains a character that is unsafe for cmd.exe.'
+    }
+
+    return (ConvertTo-NativeArgument -Value $Value -AlwaysQuote)
+}
+
 function New-WorkerProcessStartInfo {
     param(
         [Parameter(Mandatory)]
         [string]$FilePath,
 
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string[]]$Arguments,
 
         [Parameter(Mandatory)]
@@ -445,6 +520,7 @@ function New-WorkerProcessStartInfo {
     $extension = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
     $launchPath = $FilePath
     $launchArguments = $Arguments
+    $launchArgumentText = $null
 
     if ($extension -eq '.ps1') {
         $launchPath = Get-CurrentPowerShellExecutable
@@ -462,19 +538,35 @@ function New-WorkerProcessStartInfo {
                 'preserve arbitrary prompt arguments. Configure a .ps1 or .exe entry point.'
             )
         }
-        if ([string]::IsNullOrWhiteSpace($env:ComSpec) -or
-            -not (Test-Path -LiteralPath $env:ComSpec -PathType Leaf)) {
-            throw 'cmd.exe is unavailable for the explicitly approved MiniMax wrapper.'
+        $leafName = [System.IO.Path]::GetFileName($FilePath)
+        if (-not $leafName.Equals(
+            'mmx.cmd',
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw 'Only the reviewed MiniMax mmx.cmd wrapper may use batch launch.'
         }
-        $launchPath = $env:ComSpec
-        $launchArguments = @('/d', '/s', '/c', $FilePath) + $Arguments
+        $systemDirectory = [Environment]::GetFolderPath(
+            [Environment+SpecialFolder]::System
+        )
+        $launchPath = Join-Path $systemDirectory 'cmd.exe'
+        if (-not (Test-Path -LiteralPath $launchPath -PathType Leaf)) {
+            throw 'System cmd.exe is unavailable for the reviewed MiniMax wrapper.'
+        }
+        $batchCommand = (@($FilePath) + @($Arguments) | ForEach-Object {
+            ConvertTo-ReviewedCmdToken -Value ([string]$_)
+        }) -join ' '
+        $launchArgumentText = '/d /v:off /s /c "' + $batchCommand + '"'
     }
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $launchPath
-    $startInfo.Arguments = ($launchArguments | ForEach-Object {
-        ConvertTo-NativeArgument -Value ([string]$_)
-    }) -join ' '
+    $startInfo.Arguments = if ($null -ne $launchArgumentText) {
+        $launchArgumentText
+    } else {
+        ($launchArguments | ForEach-Object {
+            ConvertTo-NativeArgument -Value ([string]$_)
+        }) -join ' '
+    }
     $startInfo.WorkingDirectory = $Directory
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
@@ -494,17 +586,731 @@ function New-WorkerProcessStartInfo {
     return $startInfo
 }
 
-function Stop-WorkerProcessTree {
-    param(
-        [Parameter(Mandatory)]
-        [System.Diagnostics.Process]$Process
-    )
-
-    if ($Process.HasExited) {
+function Initialize-AiwJobObjectInterop {
+    if ($null -ne ('AiwOrchestrator.NativeJobObject' -as [type]) -and
+        $null -ne ('AiwOrchestrator.SuspendedWorkerProcess' -as [type]) -and
+        $null -ne ('AiwOrchestrator.BoundedStreamCapture' -as [type])) {
         return $true
     }
 
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using Microsoft.Win32.SafeHandles;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace AiwOrchestrator
+{
+    public static class NativeJobObject
+    {
+        public const string Library = "kernel32.dll";
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr CreateJobObject(IntPtr jobAttributes, string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetInformationJobObject(
+            IntPtr job,
+            int informationClass,
+            IntPtr information,
+            uint informationLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr handle);
+
+        public static bool EnableKillOnClose(IntPtr job)
+        {
+            AiwJobObjectExtendedLimitInformation information =
+                new AiwJobObjectExtendedLimitInformation();
+            information.BasicLimitInformation.LimitFlags = 0x00002000;
+            int size = Marshal.SizeOf(typeof(AiwJobObjectExtendedLimitInformation));
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                Marshal.StructureToPtr(information, buffer, false);
+                return SetInformationJobObject(job, 9, buffer, (uint)size);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct AiwJobObjectBasicLimitInformation
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct AiwIoCounters
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct AiwJobObjectExtendedLimitInformation
+    {
+        public AiwJobObjectBasicLimitInformation BasicLimitInformation;
+        public AiwIoCounters IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct AiwSecurityAttributes
+    {
+        public int nLength;
+        public IntPtr lpSecurityDescriptor;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool bInheritHandle;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct AiwStartupInfo
+    {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public uint dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct AiwStartupInfoEx
+    {
+        public AiwStartupInfo StartupInfo;
+        public IntPtr lpAttributeList;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct AiwProcessInformation
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public uint dwProcessId;
+        public uint dwThreadId;
+    }
+
+    internal static class AiwNativeProcess
+    {
+        internal const uint CreateSuspended = 0x00000004;
+        internal const uint CreateNoWindow = 0x08000000;
+        internal const uint ExtendedStartupInfoPresent = 0x00080000;
+        internal const uint StartfUseStdHandles = 0x00000100;
+        internal const uint HandleFlagInherit = 0x00000001;
+        internal static readonly IntPtr ProcThreadAttributeHandleList =
+            new IntPtr(0x00020002);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool CreatePipe(
+            out IntPtr readPipe,
+            out IntPtr writePipe,
+            ref AiwSecurityAttributes attributes,
+            uint size); // pipe size
+
+        [DllImport(NativeJobObject.Library, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool SetHandleInformation(
+            IntPtr handle,
+            uint mask,
+            uint flags);
+
+        [DllImport(NativeJobObject.Library, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool InitializeProcThreadAttributeList(
+            IntPtr attributeList,
+            int attributeCount,
+            uint flags,
+            ref IntPtr size);
+
+        [DllImport(NativeJobObject.Library, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool UpdateProcThreadAttribute(
+            IntPtr attributeList,
+            uint flags,
+            IntPtr attribute,
+            IntPtr value,
+            IntPtr size,
+            IntPtr previousValue,
+            IntPtr returnSize);
+
+        [DllImport(NativeJobObject.Library)]
+        internal static extern void DeleteProcThreadAttributeList(
+            IntPtr attributeList);
+
+        [DllImport(
+            NativeJobObject.Library,
+            EntryPoint = "CreateProcessW",
+            CharSet = CharSet.Unicode,
+            SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool CreateProcessWithAttributes(
+            string applicationName,
+            StringBuilder commandLine,
+            IntPtr processAttributes,
+            IntPtr threadAttributes,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandles,
+            uint creationFlags,
+            IntPtr environment,
+            string currentDirectory,
+            ref AiwStartupInfoEx startupInfo,
+            out AiwProcessInformation processInformation);
+
+        [DllImport(NativeJobObject.Library, SetLastError = true)]
+        internal static extern uint ResumeThread(IntPtr threadHandle);
+
+        [DllImport(NativeJobObject.Library, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool TerminateProcess(IntPtr processHandle, uint exitCode);
+
+        internal static void CloseQuietly(ref IntPtr handle)
+        {
+            if (handle == IntPtr.Zero) return;
+            NativeJobObject.CloseHandle(handle);
+            handle = IntPtr.Zero;
+        }
+
+        internal static void ThrowLastError()
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+
+    internal sealed class AiwHandleAllowList : IDisposable
+    {
+        private IntPtr attributeList;
+        private IntPtr handleValues;
+        private bool initialized;
+
+        internal IntPtr Pointer
+        {
+            get { return attributeList; }
+        }
+
+        internal AiwHandleAllowList(params IntPtr[] handles)
+        {
+            if (handles == null || handles.Length == 0)
+                throw new ArgumentException(
+                    "At least one inheritable handle is required.",
+                    "handles");
+
+            try
+            {
+                IntPtr attributeBytes = IntPtr.Zero;
+                AiwNativeProcess.InitializeProcThreadAttributeList(
+                    IntPtr.Zero,
+                    1,
+                    0,
+                    ref attributeBytes);
+                if (attributeBytes == IntPtr.Zero)
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+
+                attributeList = Marshal.AllocHGlobal(attributeBytes);
+                if (!AiwNativeProcess.InitializeProcThreadAttributeList(
+                    attributeList,
+                    1,
+                    0,
+                    ref attributeBytes))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                initialized = true;
+
+                int byteCount = checked(IntPtr.Size * handles.Length);
+                handleValues = Marshal.AllocHGlobal(byteCount);
+                for (int index = 0; index < handles.Length; index++)
+                {
+                    long value = handles[index].ToInt64();
+                    if (value == 0 || value == -1 || value == -2)
+                        throw new ArgumentException(
+                            "Handle list contains an invalid or pseudo handle.",
+                            "handles");
+                    Marshal.WriteIntPtr(
+                        handleValues,
+                        index * IntPtr.Size,
+                        handles[index]);
+                }
+
+                if (!AiwNativeProcess.UpdateProcThreadAttribute(
+                    attributeList,
+                    0,
+                    AiwNativeProcess.ProcThreadAttributeHandleList,
+                    handleValues,
+                    new IntPtr(byteCount),
+                    IntPtr.Zero,
+                    IntPtr.Zero))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (initialized && attributeList != IntPtr.Zero)
+            {
+                AiwNativeProcess.DeleteProcThreadAttributeList(attributeList);
+                initialized = false;
+            }
+            if (handleValues != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(handleValues);
+                handleValues = IntPtr.Zero;
+            }
+            if (attributeList != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(attributeList);
+                attributeList = IntPtr.Zero;
+            }
+        }
+    }
+
+    public sealed class SuspendedWorkerProcess : IDisposable
+    {
+        public Process Process { get; private set; }
+        public Stream StandardInput { get; private set; }
+        public Stream StandardOutput { get; private set; }
+        public Stream StandardError { get; private set; }
+
+        private IntPtr threadHandle;
+        private bool disposed;
+        private readonly Encoding standardInputEncoding = new UTF8Encoding(false);
+
+        private SuspendedWorkerProcess(
+            Process process,
+            Stream standardInput,
+            Stream standardOutput,
+            Stream standardError,
+            IntPtr primaryThread)
+        {
+            Process = process;
+            StandardInput = standardInput;
+            StandardOutput = standardOutput;
+            StandardError = standardError;
+            threadHandle = primaryThread;
+        }
+
+        public bool Resume()
+        {
+            if (threadHandle == IntPtr.Zero) return false;
+            IntPtr handle = threadHandle;
+            threadHandle = IntPtr.Zero;
+            try
+            {
+                return AiwNativeProcess.ResumeThread(handle) != UInt32.MaxValue;
+            }
+            finally
+            {
+                NativeJobObject.CloseHandle(handle);
+            }
+        }
+
+        public static SuspendedWorkerProcess Start(
+            string applicationPath,
+            string arguments,
+            string workingDirectory)
+        {
+            if (String.IsNullOrWhiteSpace(applicationPath))
+                throw new ArgumentException();
+            if (String.IsNullOrWhiteSpace(workingDirectory))
+                throw new ArgumentException();
+
+            IntPtr stdinRead = IntPtr.Zero;
+            IntPtr stdinWrite = IntPtr.Zero;
+            IntPtr stdoutRead = IntPtr.Zero;
+            IntPtr stdoutWrite = IntPtr.Zero;
+            IntPtr stderrRead = IntPtr.Zero;
+            IntPtr stderrWrite = IntPtr.Zero;
+            IntPtr processHandle = IntPtr.Zero;
+            IntPtr threadHandle = IntPtr.Zero;
+            Process process = null;
+            Stream standardInput = null;
+            Stream standardOutput = null;
+            Stream standardError = null;
+            try
+            {
+                AiwSecurityAttributes attributes = new AiwSecurityAttributes();
+                attributes.nLength = Marshal.SizeOf(typeof(AiwSecurityAttributes));
+                attributes.bInheritHandle = true;
+
+                if (!AiwNativeProcess.CreatePipe(out stdinRead, out stdinWrite, ref attributes, 0))
+                    AiwNativeProcess.ThrowLastError();
+                if (!AiwNativeProcess.SetHandleInformation(
+                    stdinWrite,
+                    AiwNativeProcess.HandleFlagInherit,
+                    0))
+                    AiwNativeProcess.ThrowLastError();
+
+                if (!AiwNativeProcess.CreatePipe(out stdoutRead, out stdoutWrite, ref attributes, 0))
+                    AiwNativeProcess.ThrowLastError();
+                if (!AiwNativeProcess.SetHandleInformation(
+                    stdoutRead,
+                    AiwNativeProcess.HandleFlagInherit,
+                    0))
+                    AiwNativeProcess.ThrowLastError();
+
+                if (!AiwNativeProcess.CreatePipe(out stderrRead, out stderrWrite, ref attributes, 0))
+                    AiwNativeProcess.ThrowLastError();
+                if (!AiwNativeProcess.SetHandleInformation(
+                    stderrRead,
+                    AiwNativeProcess.HandleFlagInherit,
+                    0))
+                    AiwNativeProcess.ThrowLastError();
+
+                AiwStartupInfoEx startup = new AiwStartupInfoEx();
+                startup.StartupInfo.cb = Marshal.SizeOf(typeof(AiwStartupInfoEx));
+                startup.StartupInfo.dwFlags = AiwNativeProcess.StartfUseStdHandles;
+                startup.StartupInfo.hStdInput = stdinRead;
+                startup.StartupInfo.hStdOutput = stdoutWrite;
+                startup.StartupInfo.hStdError = stderrWrite;
+
+                string quote = ((char)34).ToString();
+                string commandLine = quote + applicationPath + quote;
+                if (!String.IsNullOrWhiteSpace(arguments))
+                    commandLine += ((char)32).ToString() + arguments;
+                StringBuilder mutableCommandLine = new StringBuilder(commandLine);
+                AiwProcessInformation processInformation;
+                using (AiwHandleAllowList allowList = new AiwHandleAllowList(
+                    stdinRead,
+                    stdoutWrite,
+                    stderrWrite))
+                {
+                    startup.lpAttributeList = allowList.Pointer;
+                    bool created = AiwNativeProcess.CreateProcessWithAttributes(
+                        applicationPath,
+                        mutableCommandLine,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        true,
+                        AiwNativeProcess.CreateSuspended |
+                            AiwNativeProcess.CreateNoWindow |
+                            AiwNativeProcess.ExtendedStartupInfoPresent,
+                        IntPtr.Zero,
+                        workingDirectory,
+                        ref startup,
+                        out processInformation);
+                    if (!created)
+                    {
+                        int createError = Marshal.GetLastWin32Error();
+                        throw new Win32Exception(createError);
+                    }
+                }
+
+                processHandle = processInformation.hProcess;
+                threadHandle = processInformation.hThread;
+                AiwNativeProcess.CloseQuietly(ref stdinRead);
+                AiwNativeProcess.CloseQuietly(ref stdoutWrite);
+                AiwNativeProcess.CloseQuietly(ref stderrWrite);
+                process = Process.GetProcessById((int)processInformation.dwProcessId);
+
+                standardInput = new FileStream(
+                    new SafeFileHandle(stdinWrite, true),
+                    FileAccess.Write,
+                    4096,
+                    false);
+                stdinWrite = IntPtr.Zero;
+                standardOutput = new FileStream(
+                    new SafeFileHandle(stdoutRead, true),
+                    FileAccess.Read,
+                    4096,
+                    false);
+                stdoutRead = IntPtr.Zero;
+                standardError = new FileStream(
+                    new SafeFileHandle(stderrRead, true),
+                    FileAccess.Read,
+                    4096,
+                    false);
+                stderrRead = IntPtr.Zero;
+
+                AiwNativeProcess.CloseQuietly(ref processHandle);
+                SuspendedWorkerProcess result = new SuspendedWorkerProcess(
+                    process,
+                    standardInput,
+                    standardOutput,
+                    standardError,
+                    threadHandle);
+                process = null;
+                standardInput = null;
+                standardOutput = null;
+                standardError = null;
+                threadHandle = IntPtr.Zero;
+                return result;
+            }
+            catch
+            {
+                if (processHandle != IntPtr.Zero)
+                    AiwNativeProcess.TerminateProcess(processHandle, 1);
+                if (standardInput != null) standardInput.Dispose();
+                if (standardOutput != null) standardOutput.Dispose();
+                if (standardError != null) standardError.Dispose();
+                if (process != null) process.Dispose();
+                throw;
+            }
+            finally
+            {
+                AiwNativeProcess.CloseQuietly(ref stdinRead);
+                AiwNativeProcess.CloseQuietly(ref stdinWrite);
+                AiwNativeProcess.CloseQuietly(ref stdoutRead);
+                AiwNativeProcess.CloseQuietly(ref stdoutWrite);
+                AiwNativeProcess.CloseQuietly(ref stderrRead);
+                AiwNativeProcess.CloseQuietly(ref stderrWrite);
+                AiwNativeProcess.CloseQuietly(ref processHandle);
+                AiwNativeProcess.CloseQuietly(ref threadHandle);
+            }
+        }
+
+        public Task WriteAndCloseInputAsync(string text)
+        {
+            if (StandardInput == null) return Task.FromResult(0);
+            return WriteAndCloseInputCoreAsync(text ?? String.Empty);
+        }
+
+        private async Task WriteAndCloseInputCoreAsync(string text)
+        {
+            Stream input = StandardInput;
+            if (input == null) return;
+            try
+            {
+                byte[] bytes = standardInputEncoding.GetBytes(text);
+                await input.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
+                await input.FlushAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                if (Object.ReferenceEquals(StandardInput, input)) StandardInput = null;
+                input.Dispose();
+            }
+        }
+
+        public void CloseInput()
+        {
+            Stream input = StandardInput;
+            StandardInput = null;
+            if (input != null) input.Dispose();
+        }
+
+        public void Dispose()
+        {
+            if (disposed) return;
+            disposed = true;
+            CloseInput();
+            if (StandardOutput != null) StandardOutput.Dispose();
+            if (StandardError != null) StandardError.Dispose();
+            StandardOutput = null;
+            StandardError = null;
+            if (threadHandle != IntPtr.Zero)
+            {
+                NativeJobObject.CloseHandle(threadHandle);
+                threadHandle = IntPtr.Zero;
+            }
+            if (Process != null) Process.Dispose();
+            Process = null;
+        }
+    }
+
+    public sealed class BoundedStreamCapture
+    {
+        private readonly Stream stream;
+        private readonly int maximumBytes;
+        private volatile bool limitExceeded;
+
+        public bool LimitExceeded
+        {
+            get { return limitExceeded; }
+        }
+
+        public Task<string> Completion { get; private set; }
+
+        public BoundedStreamCapture(Stream stream, int maximumBytes)
+        {
+            if (stream == null) throw new ArgumentNullException("stream");
+            if (maximumBytes < 1) throw new ArgumentOutOfRangeException("maximumBytes");
+            this.stream = stream;
+            this.maximumBytes = maximumBytes;
+            Completion = ReadAsync();
+        }
+
+        private async Task<string> ReadAsync()
+        {
+            byte[] buffer = new byte[8192];
+            using (MemoryStream captured = new MemoryStream())
+            {
+                while (true)
+                {
+                    int count = await stream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
+                    if (count <= 0) break;
+                    if (!limitExceeded)
+                    {
+                        if (captured.Length + count > maximumBytes)
+                        {
+                            limitExceeded = true;
+                            continue;
+                        }
+                        captured.Write(buffer, 0, count);
+                    }
+                }
+                if (limitExceeded) return string.Empty;
+                return new UTF8Encoding(false, false).GetString(captured.ToArray());
+            }
+        }
+    }
+}
+'@ -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function New-WorkerJobObject {
+    if (-not (Initialize-AiwJobObjectInterop)) {
+        return [System.IntPtr]::Zero
+    }
+
+    try {
+        $handle = [AiwOrchestrator.NativeJobObject]::CreateJobObject([System.IntPtr]::Zero, $null)
+        if ($handle -eq [System.IntPtr]::Zero -or $handle -eq [System.IntPtr](-1)) {
+            return [System.IntPtr]::Zero
+        }
+        if (-not [AiwOrchestrator.NativeJobObject]::EnableKillOnClose($handle)) {
+            [void][AiwOrchestrator.NativeJobObject]::CloseHandle($handle)
+            return [System.IntPtr]::Zero
+        }
+        return $handle
+    } catch {
+        return [System.IntPtr]::Zero
+    }
+}
+
+function Add-WorkerProcessToJobObject {
+    param(
+        [Parameter(Mandatory)][System.IntPtr]$JobHandle,
+        [Parameter(Mandatory)][System.Diagnostics.Process]$Process
+    )
+
+    if ($JobHandle -eq [System.IntPtr]::Zero) {
+        return $false
+    }
+    try {
+        return [AiwOrchestrator.NativeJobObject]::AssignProcessToJobObject($JobHandle, $Process.Handle)
+    } catch {
+        return $false
+    }
+}
+
+function Stop-WorkerJobObject {
+    param([Parameter(Mandatory)][System.IntPtr]$JobHandle)
+
+    if ($JobHandle -eq [System.IntPtr]::Zero) {
+        return $false
+    }
+    try {
+        return [AiwOrchestrator.NativeJobObject]::TerminateJobObject($JobHandle, 124)
+    } catch {
+        return $false
+    }
+}
+
+function Close-WorkerJobObject {
+    param([Parameter(Mandatory)][System.IntPtr]$JobHandle)
+
+    if ($JobHandle -eq [System.IntPtr]::Zero) {
+        return
+    }
+    try {
+        [void][AiwOrchestrator.NativeJobObject]::CloseHandle($JobHandle)
+    } catch {
+        # The worker has already been contained or stopped; handle cleanup is best-effort.
+    }
+}
+
+function Stop-WorkerProcessTree {
+    param(
+        [Parameter(Mandatory)]
+        [System.Diagnostics.Process]$Process,
+
+        [System.IntPtr]$JobHandle = [System.IntPtr]::Zero,
+
+        [bool]$JobAssigned = $false
+    )
+
+    if ($Process.HasExited) {
+        if ($JobAssigned -and (Stop-WorkerJobObject -JobHandle $JobHandle)) {
+            return [pscustomobject]@{
+                processTerminated = $true
+                treeTerminationConfirmed = $true
+                strategy = 'job-object-root-exited'
+            }
+        }
+        return [pscustomobject]@{
+            processTerminated = $true
+            treeTerminationConfirmed = $false
+            strategy = 'already-exited'
+        }
+    }
+
     $terminated = $false
+    if ($JobAssigned -and (Stop-WorkerJobObject -JobHandle $JobHandle)) {
+        $terminated = $Process.WaitForExit(10000)
+        if (-not $terminated) {
+            $terminated = $Process.HasExited
+        }
+        if ($terminated) {
+            return [pscustomobject]@{
+                processTerminated = $true
+                treeTerminationConfirmed = $true
+                strategy = 'job-object'
+            }
+        }
+    }
+
     $taskKillPath = Join-Path $env:SystemRoot 'System32\taskkill.exe'
     if (Test-Path -LiteralPath $taskKillPath -PathType Leaf) {
         try {
@@ -524,7 +1330,11 @@ function Stop-WorkerProcessTree {
         }
     }
 
-    return ($terminated -or $Process.HasExited)
+    return [pscustomobject]@{
+        processTerminated = ($terminated -or $Process.HasExited)
+        treeTerminationConfirmed = $false
+        strategy = 'taskkill-fallback'
+    }
 }
 
 function Get-TaskTextWithin {
@@ -558,6 +1368,7 @@ function Invoke-NativeWorker {
         [string]$FilePath,
 
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string[]]$Arguments,
 
         [Parameter(Mandatory)]
@@ -580,54 +1391,222 @@ function Invoke-NativeWorker {
 
     $hasStandardInput = $null -ne $StandardInputText
     $startInfo = New-WorkerProcessStartInfo -FilePath $FilePath -Arguments $Arguments -Directory $Directory -RedirectStandardInput $hasStandardInput -AllowBatchWorker $AllowBatchWorker
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $startInfo
+    $process = $null
+    $nativeWorker = $null
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $timedOut = $false
     $terminationSucceeded = $true
+    $treeTerminationConfirmed = $false
+    $jobHandle = [System.IntPtr]::Zero
+    $jobAssigned = $false
+    $outputLimitExceeded = $false
+    $stdoutCapture = $null
+    $stderrCapture = $null
+    $stdoutTask = $null
+    $stderrTask = $null
+    $inputTask = $null
+    $inputWriteFailed = $false
 
     try {
-        if (-not $process.Start()) {
-            throw ('Worker process failed to start: {0}' -f $FilePath)
+        if (-not (Initialize-AiwJobObjectInterop)) {
+            throw 'Worker containment and bounded stream capture are unavailable on this host.'
+        }
+
+        $jobHandle = New-WorkerJobObject
+        if ($jobHandle -eq [System.IntPtr]::Zero) {
+            throw 'Worker process containment could not be initialized.'
+        }
+
+        $nativeWorker = [AiwOrchestrator.SuspendedWorkerProcess]::Start(
+            [string]$startInfo.FileName,
+            [string]$startInfo.Arguments,
+            [string]$startInfo.WorkingDirectory
+        )
+        $process = $nativeWorker.Process
+
+        $jobAssigned = Add-WorkerProcessToJobObject -JobHandle $jobHandle -Process $process
+        if (-not $jobAssigned) {
+            $nativeWorker.CloseInput()
+            $termination = Stop-WorkerProcessTree `
+                -Process $process `
+                -JobHandle $jobHandle `
+                -JobAssigned $false
+            $terminationSucceeded = $termination.processTerminated
+            $treeTerminationConfirmed = $termination.treeTerminationConfirmed
+            throw 'Worker process containment could not be established.'
+        }
+
+        $stdoutCapture = [AiwOrchestrator.BoundedStreamCapture]::new(
+            $nativeWorker.StandardOutput,
+            [int]$script:MaxWorkerStreamBytes
+        )
+        $stderrCapture = [AiwOrchestrator.BoundedStreamCapture]::new(
+            $nativeWorker.StandardError,
+            [int]$script:MaxWorkerStreamBytes
+        )
+        $stdoutTask = $stdoutCapture.Completion
+        $stderrTask = $stderrCapture.Completion
+
+        if (-not $nativeWorker.Resume()) {
+            $nativeWorker.CloseInput()
+            $termination = Stop-WorkerProcessTree `
+                -Process $process `
+                -JobHandle $jobHandle `
+                -JobAssigned $jobAssigned
+            $terminationSucceeded = $termination.processTerminated
+            $treeTerminationConfirmed = $termination.treeTerminationConfirmed
+            throw 'Worker process could not be resumed after containment was established.'
         }
 
         if ($hasStandardInput) {
-            $process.StandardInput.Write($StandardInputText)
-            $process.StandardInput.Close()
+            $inputTask = $nativeWorker.WriteAndCloseInputAsync($StandardInputText)
+        } else {
+            $nativeWorker.CloseInput()
         }
 
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
         $effectiveTimeoutMilliseconds = if ($ProcessTimeoutMilliseconds -gt 0) {
             $ProcessTimeoutMilliseconds
         } else {
             $ProcessTimeoutSeconds * 1000
         }
-        if (-not $process.WaitForExit($effectiveTimeoutMilliseconds)) {
-            $timedOut = $true
-            $terminationSucceeded = Stop-WorkerProcessTree -Process $process
-        } else {
-            $process.WaitForExit()
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($effectiveTimeoutMilliseconds)
+        while (-not $process.HasExited) {
+            if ($null -ne $inputTask -and ($inputTask.IsFaulted -or $inputTask.IsCanceled)) {
+                $inputWriteFailed = $true
+                $nativeWorker.CloseInput()
+                $termination = Stop-WorkerProcessTree `
+                    -Process $process `
+                    -JobHandle $jobHandle `
+                    -JobAssigned $jobAssigned
+                $terminationSucceeded = $termination.processTerminated
+                $treeTerminationConfirmed = $termination.treeTerminationConfirmed
+                break
+            }
+
+            if ($stdoutCapture.LimitExceeded -or $stderrCapture.LimitExceeded) {
+                $outputLimitExceeded = $true
+                $nativeWorker.CloseInput()
+                $termination = Stop-WorkerProcessTree `
+                    -Process $process `
+                    -JobHandle $jobHandle `
+                    -JobAssigned $jobAssigned
+                $terminationSucceeded = $termination.processTerminated
+                $treeTerminationConfirmed = $termination.treeTerminationConfirmed
+                break
+            }
+
+            $remainingMilliseconds = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if ($remainingMilliseconds -le 0) {
+                $timedOut = $true
+                $nativeWorker.CloseInput()
+                $termination = Stop-WorkerProcessTree `
+                    -Process $process `
+                    -JobHandle $jobHandle `
+                    -JobAssigned $jobAssigned
+                $terminationSucceeded = $termination.processTerminated
+                $treeTerminationConfirmed = $termination.treeTerminationConfirmed
+                break
+            }
+
+            Start-Sleep -Milliseconds ([Math]::Min(100, [Math]::Max(1, $remainingMilliseconds)))
         }
 
-        $stdoutRead = Get-TaskTextWithin -Task $stdoutTask
-        $stderrRead = Get-TaskTextWithin -Task $stderrTask
+        if (-not $timedOut -and -not $outputLimitExceeded -and -not $inputWriteFailed) {
+            $process.WaitForExit()
+            $nativeWorker.CloseInput()
+            if ($jobAssigned) {
+                # A worker may not leave background processes behind after its root exits.
+                $treeTerminationConfirmed = Stop-WorkerJobObject -JobHandle $jobHandle
+            }
+        }
+
+        if (-not $timedOut -and -not $outputLimitExceeded -and $null -ne $inputTask) {
+            $remainingMilliseconds = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if ($remainingMilliseconds -le 0) {
+                $timedOut = $true
+                $nativeWorker.CloseInput()
+                if (-not $treeTerminationConfirmed) {
+                    $termination = Stop-WorkerProcessTree `
+                        -Process $process `
+                        -JobHandle $jobHandle `
+                        -JobAssigned $jobAssigned
+                    $terminationSucceeded = $termination.processTerminated
+                    $treeTerminationConfirmed = $termination.treeTerminationConfirmed
+                }
+            } else {
+                $inputCompleted = $false
+                try {
+                    $inputCompleted = $inputTask.Wait($remainingMilliseconds)
+                } catch {
+                    $inputCompleted = $true
+                    $inputWriteFailed = $true
+                }
+                if (-not $inputCompleted) {
+                    $timedOut = $true
+                    $nativeWorker.CloseInput()
+                    if (-not $treeTerminationConfirmed) {
+                        $termination = Stop-WorkerProcessTree `
+                            -Process $process `
+                            -JobHandle $jobHandle `
+                            -JobAssigned $jobAssigned
+                        $terminationSucceeded = $termination.processTerminated
+                        $treeTerminationConfirmed = $termination.treeTerminationConfirmed
+                    }
+                } elseif ($inputTask.IsFaulted -or $inputTask.IsCanceled) {
+                    $inputWriteFailed = $true
+                }
+            }
+        }
+
+        $streamDrainDeadline = [DateTime]::UtcNow.AddMilliseconds(5000)
+        $stdoutRead = Get-TaskTextWithin -Task $stdoutTask -WaitMilliseconds 5000
+        $remainingDrainMilliseconds = [int][Math]::Floor(
+            ($streamDrainDeadline - [DateTime]::UtcNow).TotalMilliseconds
+        )
+        $stderrRead = Get-TaskTextWithin -Task $stderrTask -WaitMilliseconds ([Math]::Max(1, $remainingDrainMilliseconds))
         $readTimedOut = -not ($stdoutRead.completed -and $stderrRead.completed)
-        $exitCode = if ($timedOut) { 124 } elseif ($readTimedOut) { 125 } else { $process.ExitCode }
+        if ($stdoutCapture.LimitExceeded -or $stderrCapture.LimitExceeded) {
+            $outputLimitExceeded = $true
+            if (-not $treeTerminationConfirmed) {
+                $nativeWorker.CloseInput()
+                $termination = Stop-WorkerProcessTree `
+                    -Process $process `
+                    -JobHandle $jobHandle `
+                    -JobAssigned $jobAssigned
+                $terminationSucceeded = $termination.processTerminated
+                $treeTerminationConfirmed = $termination.treeTerminationConfirmed
+            }
+        }
+        $exitCode = if ($outputLimitExceeded) { 126 } elseif ($timedOut) { 124 } elseif ($inputWriteFailed) { 125 } elseif ($readTimedOut) { 125 } else { $process.ExitCode }
+        $standardOutput = if ($outputLimitExceeded) { '' } else { $stdoutRead.text.TrimEnd() }
+        $standardError = if ($outputLimitExceeded) { '' } else { $stderrRead.text.TrimEnd() }
 
         return [pscustomobject]@{
             ExitCode = $exitCode
-            Output = $stdoutRead.text.TrimEnd()
-            StandardOutput = $stdoutRead.text.TrimEnd()
-            StandardError = $stderrRead.text.TrimEnd()
+            Output = $standardOutput
+            StandardOutput = $standardOutput
+            StandardError = $standardError
             TimedOut = $timedOut
             ReadTimedOut = $readTimedOut
+            InputWriteFailed = $inputWriteFailed
+            OutputLimitExceeded = $outputLimitExceeded
+            FailureKindOverride = if ($inputWriteFailed) { 'wrapper_error' } else { $null }
             DurationMs = [int64]$stopwatch.ElapsedMilliseconds
             TerminationSucceeded = $terminationSucceeded
+            ContainmentApplied = $jobAssigned
+            TreeTerminationConfirmed = $treeTerminationConfirmed
         }
     } finally {
         $stopwatch.Stop()
-        $process.Dispose()
+        if ($jobAssigned -and -not $treeTerminationConfirmed) {
+            [void](Stop-WorkerJobObject -JobHandle $jobHandle)
+        }
+        Close-WorkerJobObject -JobHandle $jobHandle
+        if ($null -ne $nativeWorker) {
+            $nativeWorker.Dispose()
+        } elseif ($null -ne $process) {
+            $process.Dispose()
+        }
     }
 }
 
@@ -637,6 +1616,13 @@ function Get-WorkerFailureKind {
         [object]$Result
     )
 
+    $override = Get-AiwProperty -Object $Result -Name 'FailureKindOverride' -DefaultValue $null
+    if (-not [string]::IsNullOrWhiteSpace([string]$override)) {
+        return [string]$override
+    }
+    if ((Get-AiwProperty -Object $Result -Name 'OutputLimitExceeded' -DefaultValue $false)) {
+        return 'output_limit'
+    }
     if ($Result.TimedOut) {
         return 'timeout'
     }
@@ -714,9 +1700,7 @@ function Write-WorkerResult {
     )
 
     $failureKind = Get-WorkerFailureKind -Result $Result
-    $diagnostics = Get-SanitizedDiagnostics -Text (
-        [string](Get-AiwProperty -Object $Result -Name 'StandardError' -DefaultValue '')
-    )
+    $diagnostics = Get-PublicWorkerDiagnostics -Result $Result
     if ($Json) {
         [pscustomobject]@{
             schemaVersion = 1
@@ -1130,16 +2114,6 @@ function Invoke-MiniMaxQuota {
     }
 }
 
-function Remove-AiwPlannedTemporaryDirectory {
-    param([Parameter(Mandatory)][object]$Plan)
-
-    $property = $Plan.PSObject.Properties['temporaryDirectory']
-    if ($null -ne $property -and
-        -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-        Remove-AiwTemporaryDirectory -Path ([string]$property.Value)
-    }
-}
-
 function Invoke-AiwPlannedWorker {
     param(
         [Parameter(Mandatory)][object]$Plan,
@@ -1148,25 +2122,148 @@ function Invoke-AiwPlannedWorker {
     )
 
     $environmentPreviousValues = @{}
+    $result = $null
+    $artifactDirectory = $null
+    $plannedArguments = @($Plan.arguments)
+    $cleanupFailed = $false
+    $executionAttempted = $false
     try {
+        $artifactProperty = $Plan.PSObject.Properties['artifact']
+        if ($null -ne $artifactProperty -and $null -ne $artifactProperty.Value) {
+            $artifactPlan = $artifactProperty.Value
+            $workOrder = switch ([string]$artifactPlan.kind) {
+                'antigravity-work-order' {
+                    New-EphemeralGoogleWorkOrder -Text ([string]$artifactPlan.promptText)
+                    break
+                }
+                'minimax-messages' {
+                    New-EphemeralMiniMaxMessages -Text ([string]$artifactPlan.promptText)
+                    break
+                }
+                default {
+                    throw 'The execution plan requested an unsupported controlled artifact.'
+                }
+            }
+            $artifactDirectory = [string]$workOrder.directory
+            $fileArgumentIndex = [int]$artifactPlan.fileArgumentIndex
+            if ($fileArgumentIndex -lt 0 -or
+                $fileArgumentIndex -ge $plannedArguments.Count -or
+                [string]::IsNullOrWhiteSpace([string]$artifactPlan.fileArgumentFormat)) {
+                throw 'The controlled artifact file binding is invalid.'
+            }
+            $plannedArguments[$fileArgumentIndex] = (
+                [string]$artifactPlan.fileArgumentFormat -f [string]$workOrder.path
+            )
+            $directoryIndexProperty = $artifactPlan.PSObject.Properties['directoryArgumentIndex']
+            if ($null -ne $directoryIndexProperty -and
+                $null -ne $directoryIndexProperty.Value) {
+                $directoryArgumentIndex = [int]$directoryIndexProperty.Value
+                if ($directoryArgumentIndex -lt 0 -or
+                    $directoryArgumentIndex -ge $plannedArguments.Count) {
+                    throw 'The controlled artifact directory binding is invalid.'
+                }
+                $plannedArguments[$directoryArgumentIndex] = $artifactDirectory
+            }
+        }
         foreach ($property in $Plan.environmentOverlay.PSObject.Properties) {
             $environmentPreviousValues[$property.Name] = [Environment]::GetEnvironmentVariable($property.Name)
             Set-Item -LiteralPath ('Env:{0}' -f $property.Name) -Value ([string]$property.Value)
         }
-        return Invoke-NativeWorker `
+        $executionAttempted = $true
+        $result = Invoke-NativeWorker `
             -FilePath $Plan.filePath `
-            -Arguments @($Plan.arguments) `
+            -Arguments $plannedArguments `
             -Directory $Plan.workingDirectory `
             -ProcessTimeoutSeconds $TimeoutSeconds `
             -ProcessTimeoutMilliseconds $TimeoutMilliseconds `
             -StandardInputText $Plan.standardInputText `
             -AllowBatchWorker:$Plan.allowBatchWorker
+    } catch {
+        $message = [string]$_.Exception.Message
+        $failureKind = if ($message -match '(?i)(failed to start|executable.*not found)') {
+            'process_start_failed'
+        } else {
+            'wrapper_error'
+        }
+        $result = [pscustomobject]@{
+            ExitCode = 126
+            Output = ''
+            StandardOutput = ''
+            StandardError = 'Worker execution could not be started safely.'
+            TimedOut = $false
+            ReadTimedOut = $false
+            OutputLimitExceeded = $false
+            DurationMs = 0
+            TerminationSucceeded = $false
+            ContainmentApplied = $false
+            TreeTerminationConfirmed = $false
+            FailureKindOverride = $failureKind
+        }
     } finally {
         foreach ($name in $environmentPreviousValues.Keys) {
-            Restore-EnvironmentVariable -Name $name -PreviousValue $environmentPreviousValues[$name]
+            try {
+                Restore-EnvironmentVariable -Name $name -PreviousValue $environmentPreviousValues[$name]
+            } catch {
+                $cleanupFailed = $true
+            }
         }
-        Remove-AiwPlannedTemporaryDirectory -Plan $Plan
+        if (-not [string]::IsNullOrWhiteSpace($artifactDirectory)) {
+            try {
+                Remove-AiwTemporaryDirectory -Path $artifactDirectory
+            } catch {
+                $cleanupFailed = $true
+            }
+        }
+        if ($cleanupFailed) {
+            if ($null -eq $result) {
+                $result = [pscustomobject]@{
+                    ExitCode = 126
+                    Output = ''
+                    StandardOutput = ''
+                    StandardError = ''
+                    TimedOut = $false
+                    ReadTimedOut = $false
+                    OutputLimitExceeded = $false
+                    DurationMs = 0
+                    TerminationSucceeded = $false
+                    ContainmentApplied = $false
+                    TreeTerminationConfirmed = $false
+                }
+            }
+            $originalExitCode = [int]$result.ExitCode
+            $result.ExitCode = 126
+            $result | Add-Member `
+                -MemberType NoteProperty `
+                -Name ChildExitCodeOverride `
+                -Value $originalExitCode `
+                -Force
+            $result | Add-Member `
+                -MemberType NoteProperty `
+                -Name FailureKindOverride `
+                -Value 'wrapper_error' `
+                -Force
+            $result | Add-Member `
+                -MemberType NoteProperty `
+                -Name FailurePhaseOverride `
+                -Value 'cleanup' `
+                -Force
+            $result | Add-Member `
+                -MemberType NoteProperty `
+                -Name CleanupFailed `
+                -Value $true `
+                -Force
+            $result | Add-Member `
+                -MemberType NoteProperty `
+                -Name PublicDiagnosticsOverride `
+                -Value $(if ($executionAttempted) {
+                    'Worker cleanup failed after the execution phase.'
+                } else {
+                    'Worker cleanup failed before execution could begin.'
+                }) `
+                -Force
+        }
     }
+    return $result
 }
 
 function Test-AiwFallbackAllowed {
@@ -1192,40 +2289,164 @@ function Test-AiwFallbackAllowed {
         'capability_denied',
         'launcher_unsafe',
         'wrapper_error',
+        'process_start_failed',
         'policy_denied',
-        'stream_drain_timeout'
+        'stream_drain_timeout',
+        'output_limit'
     ) -contains $FailureKind) {
         return $false
     }
-    if ($FailureKind -eq 'timeout' -and -not [bool]$NativeResult.TerminationSucceeded) {
+    if ($FailureKind -eq 'timeout' -and -not [bool](Get-AiwProperty `
+        -Object $NativeResult `
+        -Name 'TreeTerminationConfirmed' `
+        -DefaultValue $false)) {
         return $false
     }
     return @($Policy.on) -contains $FailureKind
 }
 
-if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config', 'run')) {
+function New-AiwPublicRunFailure {
+    param(
+        [Parameter(Mandatory)][object]$Request,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$FailureKind,
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('preflight', 'wrapper')][string]$Phase = 'preflight',
+        [object[]]$Errors = @()
+    )
+
+    return [pscustomobject]@{
+        schemaVersion = 2
+        productVersion = $script:AiwVersion
+        ok = $false
+        command = 'run'
+        request = $Request
+        selection = $null
+        exitCode = 2
+        timedOut = $false
+        readTimedOut = $false
+        outputLimitExceeded = $false
+        cleanupFailed = $false
+        terminationSucceeded = $false
+        containmentApplied = $false
+        treeTerminationConfirmed = $false
+        durationMs = 0
+        failureKind = $FailureKind
+        skipped = @()
+        attempts = @()
+        output = ''
+        error = [pscustomobject]@{
+            code = $Code
+            phase = $Phase
+            message = $Message
+        }
+        errors = @($Errors)
+        diagnostics = $null
+        warnings = @()
+    }
+}
+
+function Write-AiwPublicRunFailure {
+    param([Parameter(Mandatory)][object]$Result)
+
+    if ($Json) {
+        ConvertTo-Json -InputObject $Result -Depth 20
+    } else {
+        Write-Error ([string]$Result.error.message) -ErrorAction Continue
+    }
+    exit [int]$Result.exitCode
+}
+
+if ($MyInvocation.InvocationName -ne '.' -and (
+    $Command -in @('catalog', 'config', 'run') -or
+    ($OutputSchema -eq 2 -and $Command -in @('status', 'doctor'))
+)) {
     try {
+        $publicRunRequest = [pscustomobject]@{
+            worker = $Worker
+            profile = $Profile
+            route = $Route
+            mode = $Mode
+            requiredCapabilities = @($RequireCapability)
+        }
+        if ($Command -eq 'run' -and (
+            -not [string]::IsNullOrWhiteSpace($Model) -or
+            -not [string]::IsNullOrWhiteSpace($GoogleModel) -or
+            -not [string]::IsNullOrWhiteSpace($AgentModel)
+        )) {
+            $modelOverrideFailure = New-AiwPublicRunFailure `
+                -Request $publicRunRequest `
+                -Code 'MODEL_OVERRIDE_FORBIDDEN' `
+                -FailureKind 'invalid_request' `
+                -Message 'Schema v2 worker models are fixed by configuration.'
+            Write-AiwPublicRunFailure -Result $modelOverrideFailure
+        }
+        if ($Command -eq 'run' -and $MaxPromptBytes -gt 1048576) {
+            $promptLimitFailure = New-AiwPublicRunFailure `
+                -Request $publicRunRequest `
+                -Code 'PROMPT_INVALID' `
+                -FailureKind 'invalid_request' `
+                -Message 'Schema v2 work orders cannot exceed one MiB.'
+            Write-AiwPublicRunFailure -Result $promptLimitFailure
+        }
+        $coreConfigPath = if ($Command -eq 'catalog') { $null } else { Resolve-AiwCoreConfigPath }
         $coreRequest = if ($Command -eq 'catalog') {
             [pscustomobject]@{
                 command = 'catalog'
             }
-        } elseif ($Command -eq 'config') {
-            if ($Action -ne 'validate') {
-                throw 'The config command currently requires -Action validate.'
-            }
+        } elseif ($Command -in @('status', 'doctor')) {
             [pscustomobject]@{
-                command = 'config.validate'
-                configPath = $ConfigPath
+                command = 'inventory'
+                configPath = [string]$coreConfigPath
+                outputCommand = $Command
+            }
+        } elseif ($Command -eq 'config') {
+            if ($Action -eq 'validate') {
+                [pscustomobject]@{
+                    command = 'config.validate'
+                    configPath = [string]$coreConfigPath
+                }
+            } elseif ($Action -eq 'migrate') {
+                [pscustomobject]@{
+                    command = 'config.migrate'
+                    configPath = [string]$coreConfigPath
+                    destinationPath = $Destination
+                }
+            } else {
+                throw 'The config command requires -Action validate or -Action migrate.'
             }
         } else {
-            $resolvedDirectory = Resolve-WorkerDirectory -Path $WorkingDirectory
-            $promptText = Resolve-PromptText -InlinePrompt $Prompt -FilePath $PromptFile
+            try {
+                $resolvedDirectory = Resolve-WorkerDirectory -Path $WorkingDirectory
+            } catch {
+                $workDirectoryFailure = New-AiwPublicRunFailure `
+                    -Request $publicRunRequest `
+                    -Code 'WORKDIR_INVALID' `
+                    -FailureKind 'invalid_request' `
+                    -Message 'The requested working directory is invalid.'
+                Write-AiwPublicRunFailure -Result $workDirectoryFailure
+            }
+            try {
+                $promptText = Resolve-PromptText -InlinePrompt $Prompt -FilePath $PromptFile
+            } catch {
+                $promptFailure = New-AiwPublicRunFailure `
+                    -Request $publicRunRequest `
+                    -Code 'PROMPT_INVALID' `
+                    -FailureKind 'invalid_request' `
+                    -Message 'The work order is missing, invalid, or exceeds the configured limit.'
+                Write-AiwPublicRunFailure -Result $promptFailure
+            }
             if ([string]::IsNullOrWhiteSpace($promptText)) {
-                throw 'The run command requires either -Prompt or -PromptFile.'
+                $promptFailure = New-AiwPublicRunFailure `
+                    -Request $publicRunRequest `
+                    -Code 'PROMPT_INVALID' `
+                    -FailureKind 'invalid_request' `
+                    -Message 'The work order is missing, invalid, or exceeds the configured limit.'
+                Write-AiwPublicRunFailure -Result $promptFailure
             }
             [pscustomobject]@{
                 command = 'run.plan'
-                configPath = $ConfigPath
+                configPath = [string]$coreConfigPath
                 worker = $Worker
                 profile = $Profile
                 route = $Route
@@ -1243,6 +2464,11 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
             $null
         }
         $coreResult = Invoke-AiwCore -Request $coreRequest
+        $coreResult | Add-Member `
+            -MemberType NoteProperty `
+            -Name productVersion `
+            -Value $script:AiwVersion `
+            -Force
         if ($Command -eq 'run' -and $coreResult.ok) {
             $totalTimeoutMilliseconds = [int64]$TimeoutSeconds * 1000
             $attempts = @()
@@ -1254,7 +2480,6 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
             while ($attempts.Count -lt [int]$coreResult.fallbackPolicy.maxAttempts) {
                 $remainingMilliseconds = $totalTimeoutMilliseconds - $runStopwatch.ElapsedMilliseconds
                 if ($remainingMilliseconds -le 0) {
-                    Remove-AiwPlannedTemporaryDirectory -Plan $currentCoreResult.plan
                     break
                 }
                 $boundedRemainingMilliseconds = [int][Math]::Min(
@@ -1270,12 +2495,20 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
                     worker = $currentCoreResult.selection.worker
                     adapter = $currentCoreResult.selection.adapter
                     model = $currentCoreResult.selection.model
-                    childExitCode = $nativeResult.ExitCode
+                    childExitCode = (Get-AiwProperty `
+                        -Object $nativeResult `
+                        -Name 'ChildExitCodeOverride' `
+                        -DefaultValue $nativeResult.ExitCode)
                     failureKind = $failureKind
                     timedOut = $nativeResult.TimedOut
                     readTimedOut = $nativeResult.ReadTimedOut
+                    outputLimitExceeded = (Get-AiwProperty -Object $nativeResult -Name 'OutputLimitExceeded' -DefaultValue $false)
+                    terminationSucceeded = $nativeResult.TerminationSucceeded
+                    containmentApplied = (Get-AiwProperty -Object $nativeResult -Name 'ContainmentApplied' -DefaultValue $false)
+                    treeTerminationConfirmed = (Get-AiwProperty -Object $nativeResult -Name 'TreeTerminationConfirmed' -DefaultValue $false)
+                    cleanupFailed = (Get-AiwProperty -Object $nativeResult -Name 'CleanupFailed' -DefaultValue $false)
                     durationMs = $nativeResult.DurationMs
-                    diagnostics = Get-SanitizedDiagnostics -Text ([string]$nativeResult.StandardError)
+                    diagnostics = Get-PublicWorkerDiagnostics -Result $nativeResult
                 }
                 if ($nativeResult.ExitCode -eq 0) {
                     break
@@ -1324,8 +2557,11 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
                     StandardError = ''
                     TimedOut = $true
                     ReadTimedOut = $false
+                    OutputLimitExceeded = $false
                     DurationMs = [int64]$runStopwatch.ElapsedMilliseconds
                     TerminationSucceeded = $true
+                    ContainmentApplied = $true
+                    TreeTerminationConfirmed = $true
                 }
                 $failureKind = 'timeout'
             }
@@ -1341,6 +2577,7 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
             }
             $runResult = [pscustomobject]@{
                 schemaVersion = 2
+                productVersion = $script:AiwVersion
                 ok = ($nativeResult.ExitCode -eq 0)
                 command = 'run'
                 request = $coreResult.request
@@ -1348,7 +2585,11 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
                 exitCode = $publicExitCode
                 timedOut = $nativeResult.TimedOut
                 readTimedOut = $nativeResult.ReadTimedOut
+                outputLimitExceeded = (Get-AiwProperty -Object $nativeResult -Name 'OutputLimitExceeded' -DefaultValue $false)
+                cleanupFailed = (Get-AiwProperty -Object $nativeResult -Name 'CleanupFailed' -DefaultValue $false)
                 terminationSucceeded = $nativeResult.TerminationSucceeded
+                containmentApplied = (Get-AiwProperty -Object $nativeResult -Name 'ContainmentApplied' -DefaultValue $false)
+                treeTerminationConfirmed = (Get-AiwProperty -Object $nativeResult -Name 'TreeTerminationConfirmed' -DefaultValue $false)
                 durationMs = [int64]$runStopwatch.ElapsedMilliseconds
                 failureKind = $failureKind
                 skipped = @($allSkipped)
@@ -1359,11 +2600,21 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
                 } else {
                     [pscustomobject]@{
                         code = $failureKind.ToUpperInvariant()
-                        phase = 'execution'
-                        message = 'Worker execution failed.'
+                        phase = (Get-AiwProperty `
+                            -Object $nativeResult `
+                            -Name 'FailurePhaseOverride' `
+                            -DefaultValue 'execution')
+                        message = if ([bool](Get-AiwProperty `
+                            -Object $nativeResult `
+                            -Name 'CleanupFailed' `
+                            -DefaultValue $false)) {
+                            'Worker cleanup failed.'
+                        } else {
+                            'Worker execution failed.'
+                        }
                     }
                 }
-                diagnostics = Get-SanitizedDiagnostics -Text ([string]$nativeResult.StandardError)
+                diagnostics = Get-PublicWorkerDiagnostics -Result $nativeResult
                 warnings = @()
             }
             if ($Json) {
@@ -1382,7 +2633,11 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
             ConvertTo-Json -InputObject $coreResult -Depth 20
         } elseif ($Command -eq 'config') {
             if ($coreResult.ok) {
-                Write-Output ('Configuration is valid (schema {0}).' -f $coreResult.configSchemaVersion)
+                if ($Action -eq 'migrate') {
+                    Write-Output ('Configuration migrated to {0}.' -f $coreResult.destinationPath)
+                } else {
+                    Write-Output ('Configuration is valid (schema {0}).' -f $coreResult.configSchemaVersion)
+                }
             } else {
                 $coreResult.errors | Format-Table -AutoSize
             }
@@ -1390,29 +2645,44 @@ if ($MyInvocation.InvocationName -ne '.' -and $Command -in @('catalog', 'config'
             $coreResult.adapters |
                 Select-Object id, displayName, promptTransport, @{Name = 'capabilities'; Expression = { $_.capabilities -join ', ' }} |
                 Format-Table -AutoSize
+        } elseif ($Command -in @('status', 'doctor')) {
+            $coreResult.workers |
+                Select-Object worker, adapter, available, enabled, modelPinned, provenance, path |
+                Format-Table -AutoSize
         }
         exit [int]$coreResult.exitCode
     } catch {
+        if ($Command -eq 'run') {
+            $wrapperFailure = New-AiwPublicRunFailure `
+                -Request $publicRunRequest `
+                -Code 'WRAPPER_ERROR' `
+                -FailureKind 'wrapper_error' `
+                -Message 'The wrapper failed before worker execution.' `
+                -Phase 'wrapper'
+            Write-AiwPublicRunFailure -Result $wrapperFailure
+        }
         if ($Json) {
             [pscustomobject]@{
                 schemaVersion = 2
+                productVersion = $script:AiwVersion
                 ok = $false
                 command = $Command
                 action = if ($Command -eq 'config') { $Action } else { $null }
-                exitCode = if ($Command -eq 'run') { 2 } else { 1 }
-                failureKind = if ($Command -eq 'run') { 'invalid_request' } else { 'wrapper_error' }
+                exitCode = 1
+                failureKind = 'wrapper_error'
                 errors = @()
                 error = [pscustomobject]@{
-                    code = if ($Command -eq 'run') { 'INVALID_REQUEST' } else { 'WRAPPER_ERROR' }
+                    code = 'WRAPPER_ERROR'
                     message = 'Core request failed.'
                 }
                 diagnostics = Get-SanitizedDiagnostics -Text $_.Exception.Message
                 warnings = @()
             } | ConvertTo-Json -Depth 20
         } else {
-            Write-Error (Get-SanitizedDiagnostics -Text $_.Exception.Message) -ErrorAction Continue
+            $safeDiagnostic = Get-SanitizedDiagnostics -Text $_.Exception.Message
+            Write-Error $safeDiagnostic -ErrorAction Continue
         }
-        exit $(if ($Command -eq 'run') { 2 } else { 1 })
+        exit 1
     }
 }
 

@@ -1,26 +1,8 @@
 {
-  "schemaVersion": 1,
-  "workers": {
-    "ark": {
-      "path": null,
-      "model": "glm-5.2",
-      "configPath": "%USERPROFILE%\\.claude\\settings.json"
-    },
-    "agent": {
-      "path": null,
-      "model": "ark-code-latest",
-      "configDirectory": "%USERPROFILE%\\.claude-agent-plan"
-    },
-    "google": {
-      "path": null,
-      "model": "gemini-3.6-flash-high",
-      "configDirectory": "%USERPROFILE%\\.gemini\\antigravity-cli"
-    },
-    "minimax": {
-      "path": null,
-      "model": "MiniMax-M3",
-      "baseUrl": "https://api.minimaxi.com",
-      "quotaBaseUrl": "https://www.minimaxi.com"
-    }
-  }
+  "schemaVersion": 2,
+  "defaultRoute": null,
+  "defaultProfile": null,
+  "workers": {},
+  "profiles": {},
+  "routes": {}
 }

@@ -57,6 +57,20 @@ function Read-AiwConfigDocument {
     } finally {
         $reader.Dispose()
     }
+    if ($text.Length -gt 0 -and [int][char]$text[0] -eq 0xFEFF) {
+        $text = $text.Substring(1)
+    }
+    $rawValidation = Get-AiwRawJsonValidationResult -Text $text
+    if (-not $rawValidation.syntaxOk) {
+        throw 'AIW_JSON_INVALID'
+    }
+    if (@($rawValidation.errors).Count -gt 0) {
+        return [pscustomobject]@{
+            path = $resolvedPath
+            document = $null
+            rawErrors = @($rawValidation.errors)
+        }
+    }
     try {
         $document = $text | ConvertFrom-Json
     } catch {
@@ -65,6 +79,7 @@ function Read-AiwConfigDocument {
     return [pscustomobject]@{
         path = $resolvedPath
         document = $document
+        rawErrors = @($rawValidation.errors)
     }
 }
 
@@ -146,6 +161,294 @@ function Test-AiwSecretConfigFieldName {
         'setcookie',
         'bearer'
     ) -contains $normalizedName
+}
+
+function Add-AiwRawJsonError {
+    param(
+        [Parameter(Mandatory)][object]$State,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    if ($State.Errors.Count -ge $State.MaxErrors) {
+        return
+    }
+    [void]$State.Errors.Add([pscustomobject]@{
+        code = $Code
+        path = $Path
+        message = $Message
+    })
+}
+
+function Skip-AiwRawJsonWhitespace {
+    param([Parameter(Mandatory)][object]$State)
+
+    while ($State.Index -lt $State.Length) {
+        $character = [char]$State.Text[$State.Index]
+        if ($character -ne [char]32 -and
+            $character -ne [char]9 -and
+            $character -ne [char]10 -and
+            $character -ne [char]13) {
+            break
+        }
+        $State.Index++
+    }
+}
+
+function Read-AiwRawJsonStringToken {
+    param([Parameter(Mandatory)][object]$State)
+
+    if ($State.Index -ge $State.Length -or
+        [char]$State.Text[$State.Index] -ne [char]34) {
+        throw 'AIW_JSON_SYNTAX_INVALID'
+    }
+    $State.Index++
+    $builder = New-Object System.Text.StringBuilder
+    while ($State.Index -lt $State.Length) {
+        $character = [char]$State.Text[$State.Index]
+        $State.Index++
+        if ($character -eq [char]34) {
+            return $builder.ToString()
+        }
+        if ([int]$character -lt 32) {
+            throw 'AIW_JSON_SYNTAX_INVALID'
+        }
+        if ($character -ne [char]92) {
+            [void]$builder.Append($character)
+            continue
+        }
+        if ($State.Index -ge $State.Length) {
+            throw 'AIW_JSON_SYNTAX_INVALID'
+        }
+        $escape = [char]$State.Text[$State.Index]
+        $State.Index++
+        switch ($escape) {
+            ([char]34) { [void]$builder.Append([char]34); continue }
+            ([char]92) { [void]$builder.Append([char]92); continue }
+            ([char]47) { [void]$builder.Append([char]47); continue }
+            'b' { [void]$builder.Append([char]8); continue }
+            'f' { [void]$builder.Append([char]12); continue }
+            'n' { [void]$builder.Append([char]10); continue }
+            'r' { [void]$builder.Append([char]13); continue }
+            't' { [void]$builder.Append([char]9); continue }
+            'u' {
+                if ($State.Index + 4 -gt $State.Length) {
+                    throw 'AIW_JSON_SYNTAX_INVALID'
+                }
+                $hex = $State.Text.Substring($State.Index, 4)
+                if ($hex -notmatch '^[0-9A-Fa-f]{4}$') {
+                    throw 'AIW_JSON_SYNTAX_INVALID'
+                }
+                [void]$builder.Append([char]([Convert]::ToInt32($hex, 16)))
+                $State.Index += 4
+                continue
+            }
+            default { throw 'AIW_JSON_SYNTAX_INVALID' }
+        }
+    }
+    throw 'AIW_JSON_SYNTAX_INVALID'
+}
+
+function New-AiwRawJsonPropertyPath {
+    param(
+        [Parameter(Mandatory)][string]$ParentPath,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if (Test-AiwSecretConfigFieldName -Name $Name) {
+        return $ParentPath + '.<redacted>'
+    }
+    if ($Name -match '^[A-Za-z_][A-Za-z0-9_-]{0,63}$') {
+        return $ParentPath + '.' + $Name
+    }
+    return $ParentPath + '.<field>'
+}
+
+function Read-AiwRawJsonValueToken {
+    param(
+        [Parameter(Mandatory)][object]$State,
+        [Parameter(Mandatory)][int]$Depth,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    Skip-AiwRawJsonWhitespace -State $State
+    if ($State.Index -ge $State.Length) {
+        throw 'AIW_JSON_SYNTAX_INVALID'
+    }
+    $character = [char]$State.Text[$State.Index]
+    if ($character -eq [char]123) {
+        Read-AiwRawJsonObjectToken -State $State -Depth $Depth -Path $Path
+        return
+    }
+    if ($character -eq [char]91) {
+        Read-AiwRawJsonArrayToken -State $State -Depth $Depth -Path $Path
+        return
+    }
+    if ($character -eq [char]34) {
+        [void](Read-AiwRawJsonStringToken -State $State)
+        return
+    }
+
+    $start = $State.Index
+    while ($State.Index -lt $State.Length) {
+        $current = [char]$State.Text[$State.Index]
+        if ($current -eq [char]32 -or $current -eq [char]9 -or
+            $current -eq [char]10 -or $current -eq [char]13 -or
+            $current -eq [char]44 -or $current -eq [char]93 -or
+            $current -eq [char]125) {
+            break
+        }
+        $State.Index++
+    }
+    if ($State.Index -eq $start) {
+        throw 'AIW_JSON_SYNTAX_INVALID'
+    }
+    $literal = $State.Text.Substring($start, $State.Index - $start)
+    if ($literal -notmatch '^(true|false|null|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?)$') {
+        throw 'AIW_JSON_SYNTAX_INVALID'
+    }
+}
+
+function Read-AiwRawJsonObjectToken {
+    param(
+        [Parameter(Mandatory)][object]$State,
+        [Parameter(Mandatory)][int]$Depth,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if ($Depth -gt $State.MaxDepth) {
+        Add-AiwRawJsonError `
+            -State $State `
+            -Code 'CONFIG_LIMIT_EXCEEDED' `
+            -Path $Path `
+            -Message 'Configuration nesting exceeds the supported limit.'
+        throw 'AIW_JSON_DEPTH_LIMIT'
+    }
+    $State.Index++
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    Skip-AiwRawJsonWhitespace -State $State
+    if ($State.Index -lt $State.Length -and [char]$State.Text[$State.Index] -eq [char]125) {
+        $State.Index++
+        return
+    }
+    while ($true) {
+        Skip-AiwRawJsonWhitespace -State $State
+        $name = Read-AiwRawJsonStringToken -State $State
+        $propertyPath = New-AiwRawJsonPropertyPath -ParentPath $Path -Name $name
+        if ($seen.ContainsKey($name)) {
+            Add-AiwRawJsonError `
+                -State $State `
+                -Code 'FIELD_DUPLICATE' `
+                -Path $seen[$name] `
+                -Message 'Object property is duplicated case-insensitively.'
+        } else {
+            $seen.Add($name, $propertyPath)
+        }
+        Skip-AiwRawJsonWhitespace -State $State
+        if ($State.Index -ge $State.Length -or [char]$State.Text[$State.Index] -ne [char]58) {
+            throw 'AIW_JSON_SYNTAX_INVALID'
+        }
+        $State.Index++
+        Read-AiwRawJsonValueToken -State $State -Depth ($Depth + 1) -Path $propertyPath
+        Skip-AiwRawJsonWhitespace -State $State
+        if ($State.Index -ge $State.Length) {
+            throw 'AIW_JSON_SYNTAX_INVALID'
+        }
+        $delimiter = [char]$State.Text[$State.Index]
+        if ($delimiter -eq [char]125) {
+            $State.Index++
+            return
+        }
+        if ($delimiter -ne [char]44) {
+            throw 'AIW_JSON_SYNTAX_INVALID'
+        }
+        $State.Index++
+        Skip-AiwRawJsonWhitespace -State $State
+        if ($State.Index -lt $State.Length -and [char]$State.Text[$State.Index] -eq [char]125) {
+            throw 'AIW_JSON_SYNTAX_INVALID'
+        }
+    }
+}
+
+function Read-AiwRawJsonArrayToken {
+    param(
+        [Parameter(Mandatory)][object]$State,
+        [Parameter(Mandatory)][int]$Depth,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if ($Depth -gt $State.MaxDepth) {
+        Add-AiwRawJsonError `
+            -State $State `
+            -Code 'CONFIG_LIMIT_EXCEEDED' `
+            -Path $Path `
+            -Message 'Configuration nesting exceeds the supported limit.'
+        throw 'AIW_JSON_DEPTH_LIMIT'
+    }
+    $State.Index++
+    Skip-AiwRawJsonWhitespace -State $State
+    if ($State.Index -lt $State.Length -and [char]$State.Text[$State.Index] -eq [char]93) {
+        $State.Index++
+        return
+    }
+    $index = 0
+    while ($true) {
+        Read-AiwRawJsonValueToken -State $State -Depth ($Depth + 1) -Path ('{0}[{1}]' -f $Path, $index)
+        $index++
+        Skip-AiwRawJsonWhitespace -State $State
+        if ($State.Index -ge $State.Length) {
+            throw 'AIW_JSON_SYNTAX_INVALID'
+        }
+        $delimiter = [char]$State.Text[$State.Index]
+        if ($delimiter -eq [char]93) {
+            $State.Index++
+            return
+        }
+        if ($delimiter -ne [char]44) {
+            throw 'AIW_JSON_SYNTAX_INVALID'
+        }
+        $State.Index++
+        Skip-AiwRawJsonWhitespace -State $State
+        if ($State.Index -lt $State.Length -and [char]$State.Text[$State.Index] -eq [char]93) {
+            throw 'AIW_JSON_SYNTAX_INVALID'
+        }
+    }
+}
+
+function Get-AiwRawJsonValidationResult {
+    param([AllowEmptyString()][string]$Text)
+
+    $state = [pscustomobject]@{
+        Text = $Text
+        Index = 0
+        Length = $Text.Length
+        MaxDepth = 20
+        MaxErrors = 64
+        Errors = New-Object System.Collections.ArrayList
+    }
+    try {
+        Read-AiwRawJsonValueToken -State $state -Depth 0 -Path '$'
+        Skip-AiwRawJsonWhitespace -State $state
+        if ($state.Index -ne $state.Length) {
+            throw 'AIW_JSON_SYNTAX_INVALID'
+        }
+        return [pscustomobject]@{
+            syntaxOk = $true
+            errors = @($state.Errors)
+        }
+    } catch {
+        if ($_.Exception.Message -eq 'AIW_JSON_DEPTH_LIMIT') {
+            return [pscustomobject]@{
+                syntaxOk = $true
+                errors = @($state.Errors)
+            }
+        }
+        return [pscustomobject]@{
+            syntaxOk = $false
+            errors = @()
+        }
+    }
 }
 
 function Test-AiwIntegerValue {
@@ -377,61 +680,6 @@ function Get-AiwAdapterDescriptor {
     return @(Get-AiwAdapterCatalog | Where-Object { $_.id -eq $Id } | Select-Object -First 1)[0]
 }
 
-function New-AiwMiniMaxMessageArtifact {
-    param([Parameter(Mandatory)][string]$PromptText)
-
-    $directory = Join-Path ([System.IO.Path]::GetTempPath()) ('aiw-minimax-{0}' -f [guid]::NewGuid().ToString('N'))
-    [void](New-Item -ItemType Directory -Path $directory -ErrorAction Stop)
-    $path = Join-Path $directory 'messages.json'
-    try {
-        $messages = @(
-            [pscustomobject]@{
-                role = 'user'
-                content = $PromptText
-            }
-        )
-        $json = ConvertTo-Json -InputObject $messages -Depth 5 -Compress
-        [System.IO.File]::WriteAllText(
-            $path,
-            $json,
-            (New-Object System.Text.UTF8Encoding($false))
-        )
-    } catch {
-        if (Test-Path -LiteralPath $directory -PathType Container) {
-            Remove-Item -LiteralPath $directory -Recurse -Force
-        }
-        throw
-    }
-    return [pscustomobject]@{
-        directory = $directory
-        path = $path
-    }
-}
-
-function New-AiwAntigravityWorkOrderArtifact {
-    param([Parameter(Mandatory)][string]$PromptText)
-
-    $directory = Join-Path ([System.IO.Path]::GetTempPath()) ('aiw-google-{0}' -f [guid]::NewGuid().ToString('N'))
-    [void](New-Item -ItemType Directory -Path $directory -ErrorAction Stop)
-    $path = Join-Path $directory 'work-order.md'
-    try {
-        [System.IO.File]::WriteAllText(
-            $path,
-            $PromptText,
-            (New-Object System.Text.UTF8Encoding($false))
-        )
-    } catch {
-        if (Test-Path -LiteralPath $directory -PathType Container) {
-            Remove-Item -LiteralPath $directory -Recurse -Force
-        }
-        throw
-    }
-    return [pscustomobject]@{
-        directory = $directory
-        path = $path
-    }
-}
-
 function Get-AiwWorkerValidationErrors {
     param(
         [AllowNull()]
@@ -546,6 +794,25 @@ function Get-AiwWorkerValidationErrors {
                 message = 'Worker adapter is missing or unsupported.'
             })
             continue
+        }
+
+        if ($null -ne $pathProperty -and $pathProperty.Value -is [string] -and
+            -not [string]::IsNullOrWhiteSpace([string]$pathProperty.Value)) {
+            $configuredLeaf = [System.IO.Path]::GetFileName(
+                [Environment]::ExpandEnvironmentVariables([string]$pathProperty.Value)
+            ).ToLowerInvariant()
+            $allowedLeafNames = switch ($adapter.id) {
+                'claude-code/v1' { @('claude.exe', 'claude.ps1') }
+                'antigravity/v1' { @('agy.exe', 'agy.ps1') }
+                'minimax-cli/v1' { @('mmx.exe', 'mmx.ps1', 'mmx.cmd') }
+            }
+            if ($allowedLeafNames -notcontains $configuredLeaf) {
+                Write-Output ([pscustomobject]@{
+                    code = 'LAUNCHER_UNSAFE'
+                    path = $workerPath + '.path'
+                    message = 'Worker path must use the reviewed executable filename for its adapter.'
+                })
+            }
         }
 
         if ($adapter.id -eq 'minimax-cli/v1') {
@@ -733,7 +1000,7 @@ function Get-AiwProfileValidationErrors {
             }
         }
         $fallbackProperty = $profile.PSObject.Properties['fallback']
-        if ($null -ne $fallbackProperty) {
+        if ($null -ne $fallbackProperty -and $null -ne $fallbackProperty.Value) {
             Get-AiwFallbackValidationErrors `
                 -Fallback $fallbackProperty.Value `
                 -Path ($profilePath + '.fallback')
@@ -848,7 +1115,9 @@ function Get-AiwRouteValidationErrors {
             })
         }
         $defaultModeProperty = $route.PSObject.Properties['defaultMode']
-        if ($null -ne $defaultModeProperty -and [string]$defaultModeProperty.Value -ne 'read') {
+        if ($null -ne $defaultModeProperty -and
+            $null -ne $defaultModeProperty.Value -and
+            [string]$defaultModeProperty.Value -ne 'read') {
             Write-Output ([pscustomobject]@{
                 code = 'ROUTE_DEFAULT_WRITE_FORBIDDEN'
                 path = $routePath + '.defaultMode'
@@ -949,6 +1218,305 @@ function Resolve-AiwWorkerExecutablePath {
     return $resolved
 }
 
+function Find-AiwDiscoveredExecutablePath {
+    param([Parameter(Mandatory)][object]$Adapter)
+
+    $commandName = switch ($Adapter.id) {
+        'claude-code/v1' { 'claude' }
+        'antigravity/v1' { 'agy' }
+        'minimax-cli/v1' { 'mmx' }
+        default { return $null }
+    }
+    $command = Get-Command $commandName -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $command -or [string]::IsNullOrWhiteSpace([string]$command.Source) -or
+        -not (Test-Path -LiteralPath $command.Source -PathType Leaf)) {
+        return $null
+    }
+    $resolved = (Resolve-Path -LiteralPath $command.Source).Path
+    $leaf = [System.IO.Path]::GetFileName($resolved).ToLowerInvariant()
+    $allowedLeafNames = switch ($Adapter.id) {
+        'claude-code/v1' { @('claude.exe', 'claude.ps1') }
+        'antigravity/v1' { @('agy.exe', 'agy.ps1') }
+        'minimax-cli/v1' { @('mmx.exe', 'mmx.ps1', 'mmx.cmd') }
+    }
+    if ($allowedLeafNames -notcontains $leaf) {
+        return $null
+    }
+    return $resolved
+}
+
+function New-AiwDiscoveredConfigDocument {
+    $workers = [ordered]@{}
+    $inventory = @()
+    foreach ($adapter in @(Get-AiwAdapterCatalog)) {
+        $path = Find-AiwDiscoveredExecutablePath -Adapter $adapter
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            continue
+        }
+        $workerId = switch ($adapter.id) {
+            'claude-code/v1' { 'discovered-claude-code' }
+            'antigravity/v1' { 'discovered-antigravity' }
+            'minimax-cli/v1' { 'discovered-minimax-cli' }
+        }
+        $settings = [ordered]@{}
+        $runnable = $true
+        $warning = $null
+        if ($adapter.id -eq 'minimax-cli/v1') {
+            # Region determines a reviewed endpoint and cannot be guessed from PATH.
+            $runnable = $false
+            $warning = 'MiniMax discovery requires an explicit configured region before execution.'
+        }
+        $inventory += [pscustomobject]@{
+            worker = $workerId
+            adapter = $adapter.id
+            path = $path
+            available = $true
+            runnable = $runnable
+            model = $null
+            modelPinned = $false
+            capabilities = @($adapter.capabilities)
+            provenance = 'discovered'
+            warning = $warning
+        }
+        if ($runnable) {
+            $workers[$workerId] = [ordered]@{
+                adapter = $adapter.id
+                enabled = $true
+                path = $path
+                model = $null
+                capabilities = @($adapter.capabilities)
+                settings = $settings
+            }
+        }
+    }
+    $document = [ordered]@{
+        schemaVersion = 2
+        defaultRoute = $null
+        defaultProfile = $null
+        workers = $workers
+        profiles = [ordered]@{}
+        routes = [ordered]@{}
+    }
+    return [pscustomobject]@{
+        path = $null
+        configDirectory = [Environment]::CurrentDirectory
+        document = ((ConvertTo-Json -InputObject $document -Depth 20) | ConvertFrom-Json)
+        rawErrors = @()
+        inventory = @($inventory)
+        provenance = 'discovered'
+    }
+}
+
+function New-AiwInventoryResult {
+    param(
+        [AllowNull()][string]$ConfigPath,
+        [ValidateSet('status', 'doctor')][string]$OutputCommand = 'status'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        $discovered = New-AiwDiscoveredConfigDocument
+        return [pscustomobject]@{
+            schemaVersion = 2
+            ok = $true
+            command = $OutputCommand
+            exitCode = 0
+            configLoaded = $false
+            configPath = $null
+            provenance = 'discovered'
+            workers = @($discovered.inventory)
+            profiles = @()
+            routes = @()
+            adapters = @(Get-AiwAdapterCatalog)
+            error = $null
+            diagnostics = $null
+            warnings = @('No explicit v2 configuration was found; discovery did not create a configuration or choose a default worker.')
+        }
+    }
+
+    $validation = New-AiwConfigValidationResult -Path $ConfigPath
+    if (-not $validation.ok) {
+        return [pscustomobject]@{
+            schemaVersion = 2
+            ok = $false
+            command = $OutputCommand
+            exitCode = 2
+            configLoaded = $true
+            configPath = $validation.configPath
+            provenance = 'configured'
+            workers = @()
+            profiles = @()
+            routes = @()
+            adapters = @(Get-AiwAdapterCatalog)
+            error = $validation.error
+            errors = @($validation.errors)
+            diagnostics = $null
+            warnings = @()
+        }
+    }
+    if ($validation.configSchemaVersion -eq 1) {
+        return [pscustomobject]@{
+            schemaVersion = 2
+            ok = $true
+            command = $OutputCommand
+            exitCode = 0
+            configLoaded = $true
+            configPath = $validation.configPath
+            provenance = 'legacy-v1'
+            workers = @()
+            profiles = @()
+            routes = @()
+            adapters = @(Get-AiwAdapterCatalog)
+            error = $null
+            diagnostics = $null
+            warnings = @('Schema v1 inventory remains available through the compatibility facade; use config migrate for v2 worker inventory.')
+        }
+    }
+
+    $loaded = Read-AiwConfigDocument -Path $ConfigPath
+    $configDirectory = Split-Path -Parent $loaded.path
+    $workers = @()
+    foreach ($property in $loaded.document.workers.PSObject.Properties) {
+        $worker = $property.Value
+        $adapter = Get-AiwAdapterDescriptor -Id ([string]$worker.adapter)
+        $resolvedPath = $null
+        $availability = 'unavailable'
+        try {
+            $resolvedPath = Resolve-AiwWorkerExecutablePath `
+                -Worker $worker `
+                -Adapter $adapter `
+                -ConfigDirectory $configDirectory
+            $availability = 'available'
+        } catch {
+            $availability = 'unavailable'
+        }
+        $profileDirectory = $null
+        $profileDirectoryExists = $null
+        $settings = Get-AiwMigrationPropertyValue -Object $worker -Name 'settings'
+        if ($adapter.id -in @('claude-code/v1', 'minimax-cli/v1') -and $settings -is [pscustomobject]) {
+            $configDirectoryProperty = $settings.PSObject.Properties['configDirectory']
+            if ($null -ne $configDirectoryProperty -and
+                $null -ne $configDirectoryProperty.Value) {
+                $profileProbe = Get-AiwConfiguredDirectoryProbe `
+                    -Value ([string]$configDirectoryProperty.Value) `
+                    -ConfigDirectory $configDirectory
+                $profileDirectory = $profileProbe.path
+                $profileDirectoryExists = $profileProbe.exists
+                if ($availability -eq 'available' -and -not $profileDirectoryExists) {
+                    $availability = 'profile_unavailable'
+                }
+            }
+        }
+        $model = Get-AiwMigrationPropertyValue -Object $worker -Name 'model'
+        $workers += [pscustomobject]@{
+            worker = $property.Name
+            adapter = $adapter.id
+            path = $resolvedPath
+            available = ($availability -eq 'available')
+            availability = $availability
+            executableAvailable = -not [string]::IsNullOrWhiteSpace($resolvedPath)
+            profileDirectory = $profileDirectory
+            profileDirectoryExists = $profileDirectoryExists
+            enabled = [bool](Get-AiwMigrationPropertyValue -Object $worker -Name 'enabled' -DefaultValue $true)
+            model = $model
+            modelPinned = -not [string]::IsNullOrWhiteSpace([string]$model)
+            capabilities = @(
+                Get-AiwMigrationPropertyValue -Object $worker -Name 'capabilities' -DefaultValue @($adapter.capabilities)
+            )
+            provenance = 'configured'
+        }
+    }
+    $profiles = @()
+    foreach ($property in $loaded.document.profiles.PSObject.Properties) {
+        $profile = $property.Value
+        $fallbackDefinition = Get-AiwMigrationPropertyValue -Object $profile -Name 'fallback'
+        $fallbackMaxAttempts = 1
+        $fallbackFailureKinds = @()
+        if ($fallbackDefinition -is [pscustomobject]) {
+            $fallbackMaxAttempts = [int](
+                Get-AiwMigrationPropertyValue `
+                    -Object $fallbackDefinition `
+                    -Name 'maxAttempts' `
+                    -DefaultValue 1
+            )
+            $fallbackFailureKinds = @(
+                Get-AiwMigrationPropertyValue `
+                    -Object $fallbackDefinition `
+                    -Name 'on' `
+                    -DefaultValue @()
+            )
+        }
+        $profiles += [pscustomobject]@{
+            profile = $property.Name
+            workers = @(
+                Get-AiwMigrationPropertyValue -Object $profile -Name 'workers' -DefaultValue @()
+            )
+            fallback = [pscustomobject]@{
+                maxAttempts = $fallbackMaxAttempts
+                on = @($fallbackFailureKinds)
+            }
+        }
+    }
+    $routes = @()
+    foreach ($property in $loaded.document.routes.PSObject.Properties) {
+        $route = $property.Value
+        $routes += [pscustomobject]@{
+            route = $property.Name
+            profile = [string](
+                Get-AiwMigrationPropertyValue -Object $route -Name 'profile' -DefaultValue ''
+            )
+            requiredCapabilities = @(
+                Get-AiwMigrationPropertyValue `
+                    -Object $route `
+                    -Name 'requiredCapabilities' `
+                    -DefaultValue @()
+            )
+            defaultMode = [string](
+                Get-AiwMigrationPropertyValue -Object $route -Name 'defaultMode' -DefaultValue 'read'
+            )
+            allowedModes = @(
+                Get-AiwMigrationPropertyValue `
+                    -Object $route `
+                    -Name 'allowedModes' `
+                    -DefaultValue @('read')
+            )
+        }
+    }
+    $enabledWorkers = @($workers | Where-Object { $_.enabled })
+    $runnableWorkers = @($enabledWorkers | Where-Object { $_.available })
+    $doctorUnusable = $OutputCommand -eq 'doctor' -and
+        $enabledWorkers.Count -gt 0 -and
+        $runnableWorkers.Count -eq 0
+    $doctorError = if ($doctorUnusable) {
+        [pscustomobject]@{
+            code = 'CONFIGURED_WORKERS_UNAVAILABLE'
+            phase = 'discovery'
+            message = 'No enabled configured worker executable is available.'
+        }
+    } else {
+        $null
+    }
+    $warnings = @()
+    if ($doctorUnusable) {
+        $warnings += 'All enabled configured workers are unavailable. Correct the worker paths or disable unavailable workers.'
+    }
+    return [pscustomobject]@{
+        schemaVersion = 2
+        ok = (-not $doctorUnusable)
+        command = $OutputCommand
+        exitCode = if ($doctorUnusable) { 1 } else { 0 }
+        configLoaded = $true
+        configPath = $loaded.path
+        provenance = 'configured'
+        workers = @($workers)
+        profiles = @($profiles)
+        routes = @($routes)
+        adapters = @(Get-AiwAdapterCatalog)
+        error = $doctorError
+        diagnostics = $null
+        warnings = @($warnings)
+    }
+}
+
 function Resolve-AiwConfiguredDirectory {
     param(
         [Parameter(Mandatory)][string]$Value,
@@ -964,6 +1532,30 @@ function Resolve-AiwConfiguredDirectory {
         throw 'Configured native profile directory does not exist.'
     }
     return (Resolve-Path -LiteralPath $fullPath).Path
+}
+
+function Get-AiwConfiguredDirectoryProbe {
+    param(
+        [Parameter(Mandatory)][string]$Value,
+        [Parameter(Mandatory)][string]$ConfigDirectory
+    )
+
+    try {
+        $expanded = [Environment]::ExpandEnvironmentVariables($Value)
+        if (-not [System.IO.Path]::IsPathRooted($expanded)) {
+            $expanded = Join-Path $ConfigDirectory $expanded
+        }
+        $fullPath = [System.IO.Path]::GetFullPath($expanded)
+    } catch {
+        return [pscustomobject]@{ path = $null; exists = $false }
+    }
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Container)) {
+        return [pscustomobject]@{ path = $fullPath; exists = $false }
+    }
+    return [pscustomobject]@{
+        path = (Resolve-Path -LiteralPath $fullPath).Path
+        exists = $true
+    }
 }
 
 function New-AiwRunPreflightFailure {
@@ -990,7 +1582,11 @@ function New-AiwRunPreflightFailure {
         exitCode = 2
         timedOut = $false
         readTimedOut = $false
+        outputLimitExceeded = $false
+        cleanupFailed = $false
         terminationSucceeded = $false
+        containmentApplied = $false
+        treeTerminationConfirmed = $false
         durationMs = 0
         failureKind = $FailureKind
         skipped = @($Skipped)
@@ -1010,41 +1606,35 @@ function New-AiwRunPreflightFailure {
 function New-AiwRunPlan {
     param([Parameter(Mandatory)][object]$Request)
 
-    $validation = New-AiwConfigValidationResult -Path ([string]$Request.configPath)
-    if (-not $validation.ok) {
-        return [pscustomobject]@{
-            schemaVersion = 2
-            ok = $false
-            command = 'run'
-            request = [pscustomobject]@{
-                worker = $Request.worker
-                profile = $Request.profile
-                route = $Request.route
-                mode = $Request.mode
-                requiredCapabilities = @($Request.requiredCapabilities)
-            }
-            selection = $null
-            exitCode = 2
-            timedOut = $false
-            readTimedOut = $false
-            terminationSucceeded = $false
-            durationMs = 0
-            failureKind = 'config_invalid'
-            skipped = @()
-            attempts = @()
-            output = ''
-            error = [pscustomobject]@{
-                code = 'CONFIG_INVALID'
-                phase = 'preflight'
-                message = 'Configuration validation failed.'
-            }
-            errors = @($validation.errors)
-            diagnostics = $null
-            warnings = @()
+    $configuredPath = [string]$Request.configPath
+    $usingDiscovery = [string]::IsNullOrWhiteSpace($configuredPath)
+    if ($usingDiscovery) {
+        $loaded = New-AiwDiscoveredConfigDocument
+    } else {
+        $validation = New-AiwConfigValidationResult -Path $configuredPath
+        if (-not $validation.ok) {
+            $failure = New-AiwRunPreflightFailure `
+                -Request $Request `
+                -Code 'CONFIG_INVALID' `
+                -FailureKind 'config_invalid' `
+                -Message 'Configuration validation failed.'
+            $failure.errors = @($validation.errors)
+            return $failure
         }
+        if ($validation.configSchemaVersion -eq 1) {
+            return New-AiwRunPreflightFailure `
+                -Request $Request `
+                -Code 'CONFIG_MIGRATION_REQUIRED' `
+                -FailureKind 'config_invalid' `
+                -Message 'Schema v1 requires an explicit v2 migration before the generic run command can use it.'
+        }
+        $loaded = Read-AiwConfigDocument -Path $configuredPath
     }
-
-    $loaded = Read-AiwConfigDocument -Path ([string]$Request.configPath)
+    $loadedConfigDirectory = if ([string]::IsNullOrWhiteSpace([string]$loaded.path)) {
+        [string]$loaded.configDirectory
+    } else {
+        Split-Path -Parent $loaded.path
+    }
     $selectorValues = @(
         @($Request.worker, $Request.profile, $Request.route) |
             Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
@@ -1091,11 +1681,13 @@ function New-AiwRunPlan {
         $routeDefinition = $routeProperty.Value
         $selectedProfileId = [string]$routeDefinition.profile
         $routeCapabilitiesProperty = $routeDefinition.PSObject.Properties['requiredCapabilities']
-        if ($null -ne $routeCapabilitiesProperty) {
+        if ($null -ne $routeCapabilitiesProperty -and
+            $null -ne $routeCapabilitiesProperty.Value) {
             $routeCapabilities = @($routeCapabilitiesProperty.Value)
         }
         $allowedModesProperty = $routeDefinition.PSObject.Properties['allowedModes']
-        $allowedModes = if ($null -eq $allowedModesProperty) { @('read') } else { @($allowedModesProperty.Value) }
+        $allowedModes = if ($null -eq $allowedModesProperty -or
+            $null -eq $allowedModesProperty.Value) { @('read') } else { @($allowedModesProperty.Value) }
         if ($allowedModes -notcontains [string]$Request.mode) {
             return New-AiwRunPreflightFailure `
                 -Request $Request `
@@ -1135,7 +1727,7 @@ function New-AiwRunPlan {
         $fallbackProperty = $profileDefinition.PSObject.Properties['fallback']
         if ($null -ne $fallbackProperty -and $null -ne $fallbackProperty.Value) {
             $maxAttemptsProperty = $fallbackProperty.Value.PSObject.Properties['maxAttempts']
-            if ($null -ne $maxAttemptsProperty) {
+            if ($null -ne $maxAttemptsProperty -and $null -ne $maxAttemptsProperty.Value) {
                 $fallbackMaxAttempts = [int]$maxAttemptsProperty.Value
             }
             $onProperty = $fallbackProperty.Value.PSObject.Properties['on']
@@ -1206,7 +1798,7 @@ function New-AiwRunPlan {
             $candidatePath = Resolve-AiwWorkerExecutablePath `
                 -Worker $candidateWorker `
                 -Adapter $candidateAdapter `
-                -ConfigDirectory (Split-Path -Parent $loaded.path)
+                -ConfigDirectory $loadedConfigDirectory
         } catch {
             if (-not [string]::IsNullOrWhiteSpace($selectedWorkerId)) {
                 return New-AiwRunPreflightFailure `
@@ -1234,16 +1826,20 @@ function New-AiwRunPlan {
     }
 
     $modelProperty = $worker.PSObject.Properties['model']
-    $model = if ($null -eq $modelProperty) { $null } else { [string]$modelProperty.Value }
-    if ([string]::IsNullOrWhiteSpace($model)) {
-        throw ('{0} workers require a pinned model in explicit v0.3 configuration.' -f $adapter.id)
+    $model = if ($null -eq $modelProperty -or $null -eq $modelProperty.Value) {
+        $null
+    } else {
+        [string]$modelProperty.Value
+    }
+    if ($adapter.id -eq 'minimax-cli/v1' -and [string]::IsNullOrWhiteSpace($model)) {
+        throw 'MiniMax workers require a pinned model in explicit v0.3 configuration.'
     }
 
     $arguments = @()
     $standardInputText = $null
     $environmentOverlay = [pscustomobject]@{}
     $allowBatchWorker = $false
-    $temporaryDirectory = $null
+    $artifactPlan = $null
     switch ($adapter.id) {
         'claude-code/v1' {
             $permissionMode = if ([string]$Request.mode -eq 'write') { 'acceptEdits' } else { 'plan' }
@@ -1252,9 +1848,37 @@ function New-AiwRunPlan {
             } else {
                 'Read,Glob,Grep'
             }
+            $settingsProperty = $worker.PSObject.Properties['settings']
+            $settings = if ($null -eq $settingsProperty) { $null } else { $settingsProperty.Value }
+            $configDirectoryProperty = if ($null -eq $settings) {
+                $null
+            } else {
+                $settings.PSObject.Properties['configDirectory']
+            }
+            if ($null -ne $configDirectoryProperty) {
+                try {
+                    $resolvedProfileDirectory = Resolve-AiwConfiguredDirectory `
+                        -Value ([string]$configDirectoryProperty.Value) `
+                        -ConfigDirectory $loadedConfigDirectory
+                } catch {
+                    return New-AiwRunPreflightFailure `
+                        -Request $Request `
+                        -Code 'PROFILE_DIRECTORY_INVALID' `
+                        -FailureKind 'profile_directory_invalid' `
+                        -Message 'Selected worker profile directory is unavailable.' `
+                        -Skipped $skipped
+                }
+                $environmentOverlay = [pscustomobject]@{
+                    CLAUDE_CONFIG_DIR = $resolvedProfileDirectory
+                }
+            }
             $arguments = @(
-                '-p', 'Read the complete work order from standard input. Follow it only within the declared tool and permission constraints.',
-                '--model', $model,
+                '-p', 'Read the complete work order from standard input. Follow it only within the declared tool and permission constraints.'
+            )
+            if (-not [string]::IsNullOrWhiteSpace($model)) {
+                $arguments += @('--model', $model)
+            }
+            $arguments += @(
                 '--permission-mode', $permissionMode,
                 '--tools', $tools,
                 '--no-session-persistence',
@@ -1264,18 +1888,30 @@ function New-AiwRunPlan {
             $standardInputText = [string]$Request.promptText
         }
         'antigravity/v1' {
-            $artifact = New-AiwAntigravityWorkOrderArtifact -PromptText ([string]$Request.promptText)
-            $temporaryDirectory = $artifact.directory
             $arguments = @(
-                '--print', ('Read and follow the complete work order in {0}.' -f $artifact.path),
-                '--model', $model,
+                '--print', $null
+            )
+            if (-not [string]::IsNullOrWhiteSpace($model)) {
+                $arguments += @('--model', $model)
+            }
+            $arguments += @(
                 '--mode', $(if ([string]$Request.mode -eq 'write') { 'accept-edits' } else { 'plan' }),
                 '--print-timeout', ('{0}s' -f [string]$Request.timeoutSeconds),
-                '--add-dir', [string]$Request.workingDirectory,
-                '--add-dir', $artifact.directory,
+                '--add-dir', [string]$Request.workingDirectory
+            )
+            $artifactDirectoryArgumentIndex = $arguments.Count + 1
+            $arguments += @(
+                '--add-dir', $null,
                 '--sandbox',
                 '--output-format', 'text'
             )
+            $artifactPlan = [pscustomobject]@{
+                kind = 'antigravity-work-order'
+                promptText = [string]$Request.promptText
+                fileArgumentIndex = 1
+                fileArgumentFormat = 'Read and follow the complete work order in {0}.'
+                directoryArgumentIndex = $artifactDirectoryArgumentIndex
+            }
         }
         'minimax-cli/v1' {
             $settingsProperty = $worker.PSObject.Properties['settings']
@@ -1287,8 +1923,26 @@ function New-AiwRunPlan {
                 'global' { 'https://api.minimax.io' }
                 default { throw 'MiniMax workers require a reviewed region value.' }
             }
-            $artifact = New-AiwMiniMaxMessageArtifact -PromptText ([string]$Request.promptText)
-            $temporaryDirectory = $artifact.directory
+            $configDirectoryProperty = if ($null -eq $settings) {
+                $null
+            } else {
+                $settings.PSObject.Properties['configDirectory']
+            }
+            $resolvedProfileDirectory = $null
+            if ($null -ne $configDirectoryProperty) {
+                try {
+                    $resolvedProfileDirectory = Resolve-AiwConfiguredDirectory `
+                        -Value ([string]$configDirectoryProperty.Value) `
+                        -ConfigDirectory $loadedConfigDirectory
+                } catch {
+                    return New-AiwRunPreflightFailure `
+                        -Request $Request `
+                        -Code 'PROFILE_DIRECTORY_INVALID' `
+                        -FailureKind 'profile_directory_invalid' `
+                        -Message 'Selected worker profile directory is unavailable.' `
+                        -Skipped $skipped
+                }
+            }
             $arguments = @(
                 '--base-url', $baseUrl,
                 '--output', 'json',
@@ -1297,21 +1951,25 @@ function New-AiwRunPlan {
                 '--timeout', [string]$Request.timeoutSeconds,
                 'text', 'chat',
                 '--model', $model,
-                '--messages-file', $artifact.path,
+                '--messages-file'
+            )
+            $artifactFileArgumentIndex = $arguments.Count
+            $arguments += @(
+                $null,
                 '--max-tokens', '4096'
             )
+            $artifactPlan = [pscustomobject]@{
+                kind = 'minimax-messages'
+                promptText = [string]$Request.promptText
+                fileArgumentIndex = $artifactFileArgumentIndex
+                fileArgumentFormat = '{0}'
+                directoryArgumentIndex = $null
+            }
             $environmentValues = [ordered]@{
                 MINIMAX_BASE_URL = $baseUrl
             }
-            $configDirectoryProperty = if ($null -eq $settings) {
-                $null
-            } else {
-                $settings.PSObject.Properties['configDirectory']
-            }
             if ($null -ne $configDirectoryProperty) {
-                $environmentValues['MMX_CONFIG_DIR'] = Resolve-AiwConfiguredDirectory `
-                    -Value ([string]$configDirectoryProperty.Value) `
-                    -ConfigDirectory (Split-Path -Parent $loaded.path)
+                $environmentValues['MMX_CONFIG_DIR'] = $resolvedProfileDirectory
             }
             $environmentOverlay = [pscustomobject]$environmentValues
             $allowBatchWorker = [System.IO.Path]::GetExtension($filePath).Equals(
@@ -1354,7 +2012,7 @@ function New-AiwRunPlan {
             standardInputText = $standardInputText
             environmentOverlay = $environmentOverlay
             allowBatchWorker = $allowBatchWorker
-            temporaryDirectory = $temporaryDirectory
+            artifact = $artifactPlan
         }
         skipped = @($skipped)
         error = $null
@@ -1384,6 +2042,25 @@ function New-AiwConfigValidationResult {
             -Code $detailCode `
             -ErrorPath '$' `
             -Message 'Configuration could not be parsed safely.'
+    }
+    if (@($loaded.rawErrors).Count -gt 0) {
+        return [pscustomobject]@{
+            schemaVersion = 2
+            ok = $false
+            command = 'config'
+            action = 'validate'
+            configSchemaVersion = $null
+            configPath = $loaded.path
+            exitCode = 2
+            failureKind = 'config_invalid'
+            errors = @($loaded.rawErrors)
+            error = [pscustomobject]@{
+                code = 'CONFIG_INVALID'
+                message = 'Configuration validation failed.'
+            }
+            diagnostics = $null
+            warnings = @()
+        }
     }
     if ($null -eq $loaded.document -or $loaded.document -isnot [pscustomobject]) {
         return New-AiwConfigValidationFailure `
@@ -1459,6 +2136,14 @@ function New-AiwConfigValidationResult {
     )
 
     if ($errors.Count -gt 0) {
+        $sortedErrors = @($errors | Sort-Object path, code)
+        $maximumReportedErrors = 64
+        $errorsTruncated = $sortedErrors.Count -gt $maximumReportedErrors
+        $reportedErrors = @($sortedErrors | Select-Object -First $maximumReportedErrors)
+        $warnings = @()
+        if ($errorsTruncated) {
+            $warnings += 'Configuration validation errors were truncated to the first 64 stable entries.'
+        }
         return [pscustomobject]@{
             schemaVersion = 2
             ok = $false
@@ -1468,13 +2153,15 @@ function New-AiwConfigValidationResult {
             configPath = $loaded.path
             exitCode = 2
             failureKind = 'config_invalid'
-            errors = @($errors | Sort-Object path, code)
+            errors = @($reportedErrors)
+            errorCount = [int]$sortedErrors.Count
+            errorsTruncated = $errorsTruncated
             error = [pscustomobject]@{
                 code = 'CONFIG_INVALID'
                 message = 'Configuration validation failed.'
             }
             diagnostics = $null
-            warnings = @()
+            warnings = @($warnings)
         }
     }
 
@@ -1491,6 +2178,322 @@ function New-AiwConfigValidationResult {
         error = $null
         diagnostics = $null
         warnings = @()
+    }
+}
+
+function New-AiwConfigMigrationFailure {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [AllowNull()][string]$DestinationPath,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    return [pscustomobject]@{
+        schemaVersion = 2
+        ok = $false
+        command = 'config'
+        action = 'migrate'
+        sourcePath = $SourcePath
+        destinationPath = $DestinationPath
+        exitCode = 2
+        failureKind = 'config_invalid'
+        errors = @([pscustomobject]@{
+            code = $Code
+            path = '$'
+            message = $Message
+        })
+        error = [pscustomobject]@{
+            code = 'CONFIG_MIGRATION_FAILED'
+            message = 'Configuration migration was not applied.'
+        }
+        diagnostics = $null
+        warnings = @()
+    }
+}
+
+function Get-AiwMigrationPropertyValue {
+    param(
+        [AllowNull()][object]$Object,
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][object]$DefaultValue = $null
+    )
+
+    $property = Get-AiwExactObjectProperty -Object $Object -Name $Name
+    if ($null -eq $property -or $null -eq $property.Value) {
+        return $DefaultValue
+    }
+    return $property.Value
+}
+
+function Get-AiwMigrationSafeString {
+    param(
+        [AllowNull()][object]$Value,
+        [AllowNull()][object]$DefaultValue = $null,
+        [int]$MaximumLength = 256
+    )
+
+    if ($Value -is [string] -and
+        -not [string]::IsNullOrWhiteSpace([string]$Value) -and
+        ([string]$Value).Length -le $MaximumLength -and
+        [string]$Value -notmatch '[\x00-\x1F\x7F]') {
+        return [string]$Value
+    }
+    return $DefaultValue
+}
+
+function Get-AiwMigrationSafeModel {
+    param(
+        [AllowNull()][object]$Value,
+        [Parameter(Mandatory)][string]$DefaultValue
+    )
+
+    if ($Value -is [string] -and [string]$Value -match '^[A-Za-z0-9._-]{1,128}$') {
+        return [string]$Value
+    }
+    return $DefaultValue
+}
+
+function Get-AiwMigrationConfigDirectory {
+    param([AllowNull()][object]$LegacyValue)
+
+    $safeValue = Get-AiwMigrationSafeString -Value $LegacyValue -MaximumLength 1024
+    if ([string]::IsNullOrWhiteSpace($safeValue)) {
+        return $null
+    }
+    $parent = Split-Path -Parent $safeValue
+    if ([string]::IsNullOrWhiteSpace($parent)) {
+        return $null
+    }
+    return $parent
+}
+
+function New-AiwMigratedWorker {
+    param(
+        [Parameter(Mandatory)][object]$LegacyWorkers,
+        [Parameter(Mandatory)][string]$LegacyId,
+        [Parameter(Mandatory)][string]$Adapter,
+        [Parameter(Mandatory)][string]$DefaultModel,
+        [Parameter(Mandatory)][string[]]$Capabilities,
+        [ValidateSet('none', 'configDirectory', 'configPathDirectory')][string]$SettingsMode = 'none'
+    )
+
+    $legacyWorker = Get-AiwMigrationPropertyValue -Object $LegacyWorkers -Name $LegacyId
+    $model = Get-AiwMigrationSafeModel `
+        -Value (Get-AiwMigrationPropertyValue -Object $legacyWorker -Name 'model') `
+        -DefaultValue $DefaultModel
+    $path = Get-AiwMigrationSafeString `
+        -Value (Get-AiwMigrationPropertyValue -Object $legacyWorker -Name 'path') `
+        -MaximumLength 1024
+    $settings = [ordered]@{}
+    if ($SettingsMode -eq 'configDirectory') {
+        $directory = Get-AiwMigrationSafeString `
+            -Value (Get-AiwMigrationPropertyValue -Object $legacyWorker -Name 'configDirectory') `
+            -MaximumLength 1024
+        if (-not [string]::IsNullOrWhiteSpace($directory)) {
+            $settings['configDirectory'] = $directory
+        }
+    } elseif ($SettingsMode -eq 'configPathDirectory') {
+        $directory = Get-AiwMigrationConfigDirectory `
+            -LegacyValue (Get-AiwMigrationPropertyValue -Object $legacyWorker -Name 'configPath')
+        if (-not [string]::IsNullOrWhiteSpace($directory)) {
+            $settings['configDirectory'] = $directory
+        }
+    }
+
+    return [ordered]@{
+        adapter = $Adapter
+        enabled = $true
+        path = $path
+        model = $model
+        capabilities = @($Capabilities)
+        settings = $settings
+    }
+}
+
+function Invoke-AiwConfigMigration {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [AllowNull()][string]$DestinationPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DestinationPath)) {
+        return New-AiwConfigMigrationFailure `
+            -SourcePath $SourcePath `
+            -DestinationPath $DestinationPath `
+            -Code 'DESTINATION_REQUIRED' `
+            -Message 'Migration requires a new destination path.'
+    }
+
+    try {
+        $source = Read-AiwConfigDocument -Path $SourcePath
+    } catch {
+        $code = switch ($_.Exception.Message) {
+            'AIW_CONFIG_NOT_FOUND' { 'CONFIG_NOT_FOUND' }
+            'AIW_CONFIG_LIMIT_EXCEEDED' { 'CONFIG_LIMIT_EXCEEDED' }
+            'AIW_ENCODING_INVALID' { 'ENCODING_INVALID' }
+            default { 'JSON_INVALID' }
+        }
+        return New-AiwConfigMigrationFailure `
+            -SourcePath $SourcePath `
+            -DestinationPath $DestinationPath `
+            -Code $code `
+            -Message 'Migration source could not be parsed safely.'
+    }
+    if (@($source.rawErrors).Count -gt 0) {
+        return New-AiwConfigMigrationFailure `
+            -SourcePath $source.path `
+            -DestinationPath $DestinationPath `
+            -Code 'CONFIG_INVALID' `
+            -Message 'Migration source contains unsafe duplicate properties.'
+    }
+    if ($null -eq $source.document -or $source.document -isnot [pscustomobject]) {
+        return New-AiwConfigMigrationFailure `
+            -SourcePath $source.path `
+            -DestinationPath $DestinationPath `
+            -Code 'MIGRATION_SOURCE_INVALID' `
+            -Message 'Migration source must be a JSON object.'
+    }
+    $schemaProperty = Get-AiwExactObjectProperty -Object $source.document -Name 'schemaVersion'
+    if ($null -eq $schemaProperty -or
+        -not (Test-AiwIntegerValue -Value $schemaProperty.Value) -or
+        [int64]$schemaProperty.Value -ne 1) {
+        return New-AiwConfigMigrationFailure `
+            -SourcePath $source.path `
+            -DestinationPath $DestinationPath `
+            -Code 'MIGRATION_SOURCE_SCHEMA_UNSUPPORTED' `
+            -Message 'Only schema v1 configuration can be migrated.'
+    }
+
+    try {
+        $destinationFull = [System.IO.Path]::GetFullPath($DestinationPath)
+    } catch {
+        return New-AiwConfigMigrationFailure `
+            -SourcePath $source.path `
+            -DestinationPath $DestinationPath `
+            -Code 'DESTINATION_INVALID' `
+            -Message 'Migration destination path is invalid.'
+    }
+    if ($destinationFull.Equals($source.path, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return New-AiwConfigMigrationFailure `
+            -SourcePath $source.path `
+            -DestinationPath $destinationFull `
+            -Code 'DESTINATION_SOURCE_CONFLICT' `
+            -Message 'Migration destination must differ from the source.'
+    }
+    if (Test-Path -LiteralPath $destinationFull) {
+        return New-AiwConfigMigrationFailure `
+            -SourcePath $source.path `
+            -DestinationPath $destinationFull `
+            -Code 'DESTINATION_EXISTS' `
+            -Message 'Migration destination already exists.'
+    }
+    $destinationDirectory = Split-Path -Parent $destinationFull
+    if ([string]::IsNullOrWhiteSpace($destinationDirectory) -or
+        -not (Test-Path -LiteralPath $destinationDirectory -PathType Container)) {
+        return New-AiwConfigMigrationFailure `
+            -SourcePath $source.path `
+            -DestinationPath $destinationFull `
+            -Code 'DESTINATION_DIRECTORY_NOT_FOUND' `
+            -Message 'Migration destination directory must already exist.'
+    }
+
+    $legacyWorkers = Get-AiwMigrationPropertyValue -Object $source.document -Name 'workers'
+    if ($legacyWorkers -isnot [pscustomobject]) {
+        $legacyWorkers = [pscustomobject]@{}
+    }
+    $miniMaxLegacy = Get-AiwMigrationPropertyValue -Object $legacyWorkers -Name 'minimax'
+    $legacyBaseUrl = Get-AiwMigrationSafeString `
+        -Value (Get-AiwMigrationPropertyValue -Object $miniMaxLegacy -Name 'baseUrl') `
+        -MaximumLength 256
+    $miniMaxRegion = if ($legacyBaseUrl -eq 'https://api.minimax.io') { 'global' } else { 'cn' }
+
+    $migratedWorkers = [ordered]@{}
+    $migratedWorkers['legacy-ark'] = New-AiwMigratedWorker `
+        -LegacyWorkers $legacyWorkers `
+        -LegacyId 'ark' `
+        -Adapter 'claude-code/v1' `
+        -DefaultModel 'glm-5.2' `
+        -Capabilities @('text.reason', 'workspace.read', 'workspace.write') `
+        -SettingsMode 'configPathDirectory'
+    $migratedAgent = New-AiwMigratedWorker `
+        -LegacyWorkers $legacyWorkers `
+        -LegacyId 'agent' `
+        -Adapter 'claude-code/v1' `
+        -DefaultModel 'ark-code-latest' `
+        -Capabilities @('text.reason', 'workspace.read', 'workspace.write') `
+        -SettingsMode 'configDirectory'
+    if (-not $migratedAgent.settings.Contains('configDirectory')) {
+        # Schema v1 used this isolated Agent Plan profile when the field was absent.
+        $migratedAgent.settings['configDirectory'] = '%USERPROFILE%\.claude-agent-plan'
+    }
+    $migratedWorkers['legacy-agent'] = $migratedAgent
+    $migratedWorkers['legacy-google'] = New-AiwMigratedWorker `
+        -LegacyWorkers $legacyWorkers `
+        -LegacyId 'google' `
+        -Adapter 'antigravity/v1' `
+        -DefaultModel 'gemini-3.6-flash-high' `
+        -Capabilities @('text.reason', 'context.long', 'workspace.read', 'workspace.write')
+    $migratedMiniMax = New-AiwMigratedWorker `
+        -LegacyWorkers $legacyWorkers `
+        -LegacyId 'minimax' `
+        -Adapter 'minimax-cli/v1' `
+        -DefaultModel 'MiniMax-M3' `
+        -Capabilities @('text.reason', 'quota.read') `
+        -SettingsMode 'configPathDirectory'
+    $migratedMiniMax.settings['region'] = $miniMaxRegion
+    $migratedWorkers['legacy-minimax'] = $migratedMiniMax
+
+    $migratedDocument = [ordered]@{
+        schemaVersion = 2
+        defaultRoute = $null
+        defaultProfile = $null
+        workers = $migratedWorkers
+        profiles = [ordered]@{}
+        routes = [ordered]@{}
+    }
+    $temporaryPath = Join-Path $destinationDirectory ('.aiw-migrate-{0}.json' -f [guid]::NewGuid().ToString('N'))
+    try {
+        [System.IO.File]::WriteAllText(
+            $temporaryPath,
+            (ConvertTo-Json -InputObject $migratedDocument -Depth 20),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $validation = New-AiwConfigValidationResult -Path $temporaryPath
+        if (-not $validation.ok) {
+            return New-AiwConfigMigrationFailure `
+                -SourcePath $source.path `
+                -DestinationPath $destinationFull `
+                -Code 'MIGRATION_OUTPUT_INVALID' `
+                -Message 'Generated migration output did not pass v2 validation.'
+        }
+        [System.IO.File]::Move($temporaryPath, $destinationFull)
+    } catch {
+        return New-AiwConfigMigrationFailure `
+            -SourcePath $source.path `
+            -DestinationPath $destinationFull `
+            -Code 'MIGRATION_WRITE_FAILED' `
+            -Message 'Migration output could not be written safely.'
+    } finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force
+        }
+    }
+
+    return [pscustomobject]@{
+        schemaVersion = 2
+        ok = $true
+        command = 'config'
+        action = 'migrate'
+        sourcePath = $source.path
+        destinationPath = $destinationFull
+        configSchemaVersion = 2
+        exitCode = 0
+        failureKind = $null
+        errors = @()
+        error = $null
+        diagnostics = $null
+        warnings = @('Migration copied only reviewed non-secret fields. Review native profile paths and model selections before first run.')
     }
 }
 
@@ -1522,12 +2525,35 @@ function Invoke-AiwCore {
                 warnings = @()
             }
         }
+        'inventory' {
+            $pathProperty = $Request.PSObject.Properties['configPath']
+            $outputCommandProperty = $Request.PSObject.Properties['outputCommand']
+            $outputCommand = if ($null -eq $outputCommandProperty) {
+                'status'
+            } else {
+                [string]$outputCommandProperty.Value
+            }
+            return New-AiwInventoryResult `
+                -ConfigPath $(if ($null -eq $pathProperty) { $null } else { [string]$pathProperty.Value }) `
+                -OutputCommand $outputCommand
+        }
         'config.validate' {
             $pathProperty = $Request.PSObject.Properties['configPath']
             if ($null -eq $pathProperty) {
                 throw 'Core config request is missing configPath.'
             }
             return New-AiwConfigValidationResult -Path ([string]$pathProperty.Value)
+        }
+        'config.migrate' {
+            $sourceProperty = $Request.PSObject.Properties['configPath']
+            if ($null -eq $sourceProperty) {
+                throw 'Core migration request is missing configPath.'
+            }
+            $destinationProperty = $Request.PSObject.Properties['destinationPath']
+            $destination = if ($null -eq $destinationProperty) { $null } else { [string]$destinationProperty.Value }
+            return Invoke-AiwConfigMigration `
+                -SourcePath ([string]$sourceProperty.Value) `
+                -DestinationPath $destination
         }
         'run.plan' {
             return New-AiwRunPlan -Request $Request

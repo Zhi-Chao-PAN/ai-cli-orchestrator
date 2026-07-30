@@ -1,4 +1,4 @@
 interface:
   display_name: "Dispatch AI Workers"
-  short_description: "Route work to prepaid local AI CLI workers"
-  default_prompt: "Use $dispatch-ai-workers to delegate this task to the appropriate prepaid local AI worker, then verify the result."
+  short_description: "Route bounded work to configured local AI CLI workers"
+  default_prompt: "Use $dispatch-ai-workers to decide whether this bounded task fits a configured worker route or profile, then verify the result independently."

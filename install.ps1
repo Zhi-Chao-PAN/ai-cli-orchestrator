@@ -64,11 +64,15 @@ function Test-AiwOwnershipMarker {
 }
 
 function Write-AiwOwnershipMarker {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ProductVersion
+    )
 
     $marker = [ordered]@{
         product = 'aiw'
         schemaVersion = 1
+        productVersion = $ProductVersion
         installedAtUtc = [DateTime]::UtcNow.ToString('o')
     }
     $content = (ConvertTo-Json -InputObject $marker -Depth 3) + [Environment]::NewLine
@@ -106,6 +110,7 @@ $requiredPaths = @(
     (Join-Path $sourceRoot 'ai-workers.ps1'),
     (Join-Path $sourceRoot 'bin\aiw.ps1'),
     (Join-Path $sourceRoot 'src\Aiw.Core.psm1'),
+    (Join-Path $sourceRoot 'version.json'),
     (Join-Path $sourceRoot 'config.example.json'),
     (Join-Path $sourceRoot 'skill-src\dispatch-ai-workers\SKILL.md'),
     (Join-Path $sourceRoot 'skill-src\dispatch-ai-workers\agents\openai.yaml')
@@ -114,6 +119,20 @@ foreach ($requiredPath in $requiredPaths) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
         throw ('This installer must be run from a complete AI CLI Orchestrator release. Missing: {0}' -f $requiredPath)
     }
+}
+
+try {
+    $versionDocument = [System.IO.File]::ReadAllText((Join-Path $sourceRoot 'version.json')) | ConvertFrom-Json
+    $versionProperty = $versionDocument.PSObject.Properties['productVersion']
+    if ($null -eq $versionProperty) {
+        throw 'Missing productVersion.'
+    }
+    $productVersion = ([string]$versionProperty.Value).Trim()
+    if ($productVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
+        throw 'Invalid productVersion.'
+    }
+} catch {
+    throw 'AIW version metadata is missing or invalid.'
 }
 
 $installRootFull = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
@@ -160,7 +179,7 @@ if ($PSCmdlet.ShouldProcess($installRootFull, 'install AI CLI Orchestrator')) {
     [void](New-Item -ItemType Directory -Path $appDirectory -Force)
     [void](New-Item -ItemType Directory -Path $binDirectory -Force)
 
-    foreach ($name in @('ai-workers.ps1', 'config.example.json', 'README.md', 'README.zh-CN.md', 'WORK_ORDER_TEMPLATE.md', 'LICENSE', 'SECURITY.md', 'CONTRIBUTING.md')) {
+    foreach ($name in @('ai-workers.ps1', 'version.json', 'config.example.json', 'README.md', 'README.zh-CN.md', 'WORK_ORDER_TEMPLATE.md', 'LICENSE', 'SECURITY.md', 'CONTRIBUTING.md')) {
         $sourcePath = Join-Path $sourceRoot $name
         if (Test-Path -LiteralPath $sourcePath -PathType Leaf) {
             Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $appDirectory $name) -Force
@@ -169,7 +188,7 @@ if ($PSCmdlet.ShouldProcess($installRootFull, 'install AI CLI Orchestrator')) {
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'bin\aiw.ps1') -Destination (Join-Path $binDirectory 'aiw.ps1') -Force
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'src') -Destination (Join-Path $appDirectory 'src') -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'skill-src') -Destination (Join-Path $appDirectory 'skill-src') -Recurse -Force
-    Write-AiwOwnershipMarker -Path $markerPath
+    Write-AiwOwnershipMarker -Path $markerPath -ProductVersion $productVersion
 
     if ($InstallCodexSkill) {
         if ($skillDirectoryExists) {
@@ -183,7 +202,7 @@ if ($PSCmdlet.ShouldProcess($installRootFull, 'install AI CLI Orchestrator')) {
         $skillSource = Join-Path $appDirectory 'skill-src\dispatch-ai-workers'
         Copy-Item -LiteralPath (Join-Path $skillSource 'SKILL.md') -Destination (Join-Path $skillRoot 'SKILL.md') -Force
         Copy-Item -LiteralPath (Join-Path $skillSource 'agents') -Destination $skillRoot -Recurse -Force
-        Write-AiwOwnershipMarker -Path $skillMarkerPath
+        Write-AiwOwnershipMarker -Path $skillMarkerPath -ProductVersion $productVersion
     }
 
     if ($AddToPath) {
@@ -197,7 +216,8 @@ if ($installed) {
     if ($null -ne $skillBackupPath) {
         Write-Output ('Backed up the previous Codex skill to {0}' -f $skillBackupPath)
     }
-    Write-Output ('Run: & {0} doctor -Json' -f (Join-Path $binDirectory 'aiw.ps1'))
+    $launcherDisplayPath = (Join-Path $binDirectory 'aiw.ps1').Replace("'", "''")
+    Write-Output ("Run: & '{0}' doctor -OutputSchema 2 -Json" -f $launcherDisplayPath)
 } else {
     Write-Output 'Installation was not applied because WhatIf was specified.'
 }
