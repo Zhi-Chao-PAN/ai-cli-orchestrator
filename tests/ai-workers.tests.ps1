@@ -624,7 +624,7 @@ namespace AiwTest
                 $parentPath,
                 @(
                     'param([string]$ChildPath, [string]$MarkerPath, [string]$ReadyPath)',
-                    '$powerShellPath = Join-Path $PSHOME ''powershell.exe''',
+                    '$powerShellPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName',
                     'Start-Process -FilePath $powerShellPath -ArgumentList @(''-NoProfile'', ''-NonInteractive'', ''-File'', $ChildPath, ''-MarkerPath'', $MarkerPath, ''-ReadyPath'', $ReadyPath) -WindowStyle Hidden',
                     '$deadline = [System.Diagnostics.Stopwatch]::StartNew()',
                     'while (-not (Test-Path -LiteralPath $ReadyPath) -and $deadline.ElapsedMilliseconds -lt 8000) { Start-Sleep -Milliseconds 20 }',
@@ -673,7 +673,7 @@ namespace AiwTest
             $parentPath,
             @(
                 'param([string]$ChildPath, [string]$MarkerPath, [string]$ReadyPath)',
-                '$powerShellPath = Join-Path $PSHOME ''powershell.exe''',
+                '$powerShellPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName',
                 'Start-Process -FilePath $powerShellPath -ArgumentList @(''-NoProfile'', ''-NonInteractive'', ''-File'', $ChildPath, ''-MarkerPath'', $MarkerPath, ''-ReadyPath'', $ReadyPath) -WindowStyle Hidden',
                 '$deadline = [System.Diagnostics.Stopwatch]::StartNew()',
                 'while (-not (Test-Path -LiteralPath $ReadyPath) -and $deadline.ElapsedMilliseconds -lt 8000) { Start-Sleep -Milliseconds 20 }',
@@ -963,10 +963,43 @@ namespace AiwTest
     Invoke-Test -Name 'PowerShell launcher forwards command arguments' -Body {
         $launcherPath = Join-Path $orchestratorRoot 'bin\aiw.ps1'
         $hostPath = Get-CurrentPowerShellExecutable
-        $launcherOutput = & $hostPath -NoLogo -NoProfile -NonInteractive -File $launcherPath status -Json
-        $launcherStatus = $launcherOutput | ConvertFrom-Json
+        $emptyUserProfile = Join-Path $tempRoot 'launcher-empty-user-profile'
+        $missingWorkerPath = Join-Path $emptyUserProfile 'missing-worker.exe'
+        [void](New-Item -ItemType Directory -Path $emptyUserProfile)
+        $environmentNames = @(
+            'USERPROFILE',
+            'AIW_CONFIG_PATH',
+            'AIW_ARK_PATH',
+            'AIW_AGENT_PATH',
+            'AIW_GOOGLE_PATH',
+            'AIW_MINIMAX_PATH'
+        )
+        $previousEnvironment = @{}
+        foreach ($name in $environmentNames) {
+            $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        }
+        try {
+            [Environment]::SetEnvironmentVariable('USERPROFILE', $emptyUserProfile, 'Process')
+            [Environment]::SetEnvironmentVariable('AIW_CONFIG_PATH', $null, 'Process')
+            foreach ($name in @('AIW_ARK_PATH', 'AIW_AGENT_PATH', 'AIW_GOOGLE_PATH', 'AIW_MINIMAX_PATH')) {
+                [Environment]::SetEnvironmentVariable($name, $missingWorkerPath, 'Process')
+            }
+
+            $launcherOutput = & $hostPath -NoLogo -NoProfile -NonInteractive -File $launcherPath status -Json
+            $launcherExitCode = $LASTEXITCODE
+            $launcherStatus = $launcherOutput | ConvertFrom-Json
+        } finally {
+            foreach ($name in $environmentNames) {
+                [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process')
+            }
+        }
+
+        Assert-Equal -Expected 0 -Actual $launcherExitCode -Message 'Launcher status returned a non-zero exit code without providers'
         Assert-Equal -Expected 'status' -Actual $launcherStatus.command -Message 'Launcher did not forward command'
         Assert-True -Condition $launcherStatus.ok -Message 'Launcher did not preserve JSON mode'
+        Assert-Equal -Expected 4 -Actual @($launcherStatus.workers).Count -Message 'Launcher status worker inventory changed'
+        $installedWorkers = @($launcherStatus.workers | Where-Object { $_.Installed })
+        Assert-Equal -Expected 0 -Actual $installedWorkers.Count -Message 'Launcher reported a missing provider as installed'
     }
 
     Invoke-Test -Name 'PowerShell launcher returns zero after a successful worker' -Body {

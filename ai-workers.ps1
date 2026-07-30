@@ -1743,7 +1743,8 @@ function Write-WorkerResult {
 function Get-SafeStatus {
     $claudeConfigured = $false
     $claudeModel = $null
-    if (Test-Path -LiteralPath $script:ClaudeConfigPath) {
+    if (-not [string]::IsNullOrWhiteSpace($script:ClaudeConfigPath) -and
+        (Test-Path -LiteralPath $script:ClaudeConfigPath -PathType Leaf)) {
         try {
             $claudeSettings = Get-Content -Raw -LiteralPath $script:ClaudeConfigPath | ConvertFrom-Json
             $claudeConfigured = [bool]$claudeSettings.env.ANTHROPIC_BASE_URL -and
@@ -1756,7 +1757,8 @@ function Get-SafeStatus {
 
     $agentPlanConfigured = $false
     $agentPlanModel = $null
-    if (Test-Path -LiteralPath $script:AgentPlanConfigPath) {
+    if (-not [string]::IsNullOrWhiteSpace($script:AgentPlanConfigPath) -and
+        (Test-Path -LiteralPath $script:AgentPlanConfigPath -PathType Leaf)) {
         try {
             $agentPlanSettings = Get-Content -Raw -LiteralPath $script:AgentPlanConfigPath | ConvertFrom-Json
             $agentPlanConfigured =
@@ -1770,7 +1772,8 @@ function Get-SafeStatus {
 
     $miniMaxConfigured = $false
     $miniMaxRegion = $null
-    if (Test-Path -LiteralPath $script:MiniMaxConfigPath) {
+    if (-not [string]::IsNullOrWhiteSpace($script:MiniMaxConfigPath) -and
+        (Test-Path -LiteralPath $script:MiniMaxConfigPath -PathType Leaf)) {
         try {
             $miniMaxSettings = Get-Content -Raw -LiteralPath $script:MiniMaxConfigPath | ConvertFrom-Json
             $miniMaxConfigured = [bool]$miniMaxSettings.api_key
@@ -1780,31 +1783,40 @@ function Get-SafeStatus {
         }
     }
 
+    $claudeInstalled = -not [string]::IsNullOrWhiteSpace($script:ClaudePath) -and
+        (Test-Path -LiteralPath $script:ClaudePath -PathType Leaf)
+    $antigravityInstalled = -not [string]::IsNullOrWhiteSpace($script:AntigravityPath) -and
+        (Test-Path -LiteralPath $script:AntigravityPath -PathType Leaf)
+    $miniMaxInstalled = -not [string]::IsNullOrWhiteSpace($script:MiniMaxPath) -and
+        (Test-Path -LiteralPath $script:MiniMaxPath -PathType Leaf)
+    $antigravityConfigured = -not [string]::IsNullOrWhiteSpace($script:AntigravityConfigRoot) -and
+        (Test-Path -LiteralPath $script:AntigravityConfigRoot -PathType Container)
+
     $status = @(
         [pscustomobject]@{
             Worker = 'ark'
-            Installed = Test-Path -LiteralPath $script:ClaudePath
+            Installed = $claudeInstalled
             AuthConfigured = $claudeConfigured
             DefaultModel = $script:WorkerConfig.ark.model
             ReadyHint = 'Run a bounded read task to verify service availability.'
         },
         [pscustomobject]@{
             Worker = 'agent'
-            Installed = Test-Path -LiteralPath $script:ClaudePath
+            Installed = $claudeInstalled
             AuthConfigured = $agentPlanConfigured
             DefaultModel = $script:WorkerConfig.agent.model
             ReadyHint = 'Uses a separate Claude Code profile and Agent Plan quota.'
         },
         [pscustomobject]@{
             Worker = 'google'
-            Installed = Test-Path -LiteralPath $script:AntigravityPath
-            AuthConfigured = Test-Path -LiteralPath $script:AntigravityConfigRoot
+            Installed = $antigravityInstalled
+            AuthConfigured = $antigravityConfigured
             DefaultModel = $script:WorkerConfig.google.model
             ReadyHint = 'Run a bounded read task to verify account and permission state.'
         },
         [pscustomobject]@{
             Worker = 'minimax'
-            Installed = Test-Path -LiteralPath $script:MiniMaxPath
+            Installed = $miniMaxInstalled
             AuthConfigured = $miniMaxConfigured
             DefaultModel = 'MiniMax-M3'
             ReadyHint = "Region: $miniMaxRegion"
