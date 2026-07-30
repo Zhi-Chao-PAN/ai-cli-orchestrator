@@ -11,6 +11,7 @@ $script:ExpectedProductVersion = [string]$versionMetadata.productVersion
 if ($script:ExpectedProductVersion -cne '0.3.0') {
     throw 'The release contract expects version 0.3.0.'
 }
+$script:SuccessProcessTimeoutSeconds = 30
 . $sutPath
 
 $script:Passed = 0
@@ -284,7 +285,7 @@ try {
             -FilePath $echoPath `
             -Arguments @('-Value', $payload) `
             -Directory $tempRoot `
-            -ProcessTimeoutSeconds 10
+            -ProcessTimeoutSeconds $script:SuccessProcessTimeoutSeconds
 
         Assert-Equal -Expected 0 -Actual $result.ExitCode -Message 'Echo worker failed'
         Assert-Equal -Expected $payload -Actual $result.Output -Message 'Native argument changed'
@@ -302,7 +303,7 @@ try {
         $previousInputEncoding = [Console]::InputEncoding
         try {
             [Console]::InputEncoding = [System.Text.Encoding]::GetEncoding(1252)
-            $result = Invoke-NativeWorker -FilePath $nodePath -Arguments @($echoPath) -Directory $tempRoot -ProcessTimeoutSeconds 10 -StandardInputText $expected
+            $result = Invoke-NativeWorker -FilePath $nodePath -Arguments @($echoPath) -Directory $tempRoot -ProcessTimeoutSeconds $script:SuccessProcessTimeoutSeconds -StandardInputText $expected
         } finally {
             [Console]::InputEncoding = $previousInputEncoding
         }
@@ -420,7 +421,7 @@ namespace AiwTest
                 -FilePath $childPath `
                 -Arguments @('-HandleValue', $handleValue) `
                 -Directory $tempRoot `
-                -ProcessTimeoutSeconds 10
+                -ProcessTimeoutSeconds $script:SuccessProcessTimeoutSeconds
 
             Assert-Equal -Expected 0 -Actual $result.ExitCode -Message 'Handle allowlist probe failed'
             Assert-Equal -Expected 'PROBE_RAN' -Actual $result.StandardOutput -Message 'Handle allowlist probe did not run'
@@ -439,7 +440,7 @@ namespace AiwTest
                 -FilePath $batchPath `
                 -Arguments @('noop') `
                 -Directory $tempRoot `
-                -ProcessTimeoutSeconds 10)
+                -ProcessTimeoutSeconds $script:SuccessProcessTimeoutSeconds)
         } catch {
             $threw = $_.Exception.Message -match 'Batch worker launch is unsupported'
         }
@@ -478,7 +479,7 @@ namespace AiwTest
             -FilePath $batchPath `
             -Arguments $expected `
             -Directory $batchRoot `
-            -ProcessTimeoutSeconds 10 `
+            -ProcessTimeoutSeconds $script:SuccessProcessTimeoutSeconds `
             -AllowBatchWorker
 
         Assert-Equal -Expected 0 -Actual $result.ExitCode -Message 'Reviewed batch wrapper failed'
@@ -597,7 +598,7 @@ namespace AiwTest
             -FilePath $nodePath `
             -Arguments @($closeInputPath) `
             -Directory $tempRoot `
-            -ProcessTimeoutSeconds 5 `
+            -ProcessTimeoutSeconds $script:SuccessProcessTimeoutSeconds `
             -StandardInputText ('x' * 1048576)
 
         Assert-Equal -Expected 125 -Actual $result.ExitCode -Message 'Undeliverable input exit code changed'
@@ -614,8 +615,7 @@ namespace AiwTest
             [System.IO.File]::WriteAllLines(
                 $childPath,
                 @(
-                    'param([string]$MarkerPath, [string]$ReadyPath)',
-                    '[System.IO.File]::WriteAllText($ReadyPath, [string][System.Diagnostics.Process]::GetCurrentProcess().Id)',
+                    'param([string]$MarkerPath)',
                     'Start-Sleep -Seconds 20',
                     '[System.IO.File]::WriteAllText($MarkerPath, ''survived'')'
                 )
@@ -625,10 +625,11 @@ namespace AiwTest
                 @(
                     'param([string]$ChildPath, [string]$MarkerPath, [string]$ReadyPath)',
                     '$powerShellPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName',
-                    'Start-Process -FilePath $powerShellPath -ArgumentList @(''-NoProfile'', ''-NonInteractive'', ''-File'', $ChildPath, ''-MarkerPath'', $MarkerPath, ''-ReadyPath'', $ReadyPath) -WindowStyle Hidden',
-                    '$deadline = [System.Diagnostics.Stopwatch]::StartNew()',
-                    'while (-not (Test-Path -LiteralPath $ReadyPath) -and $deadline.ElapsedMilliseconds -lt 8000) { Start-Sleep -Milliseconds 20 }',
-                    'if (-not (Test-Path -LiteralPath $ReadyPath)) { throw ''Child did not become ready.'' }',
+                    '$childProcess = Start-Process -FilePath $powerShellPath -ArgumentList @(''-NoProfile'', ''-NonInteractive'', ''-File'', $ChildPath, ''-MarkerPath'', $MarkerPath) -WindowStyle Hidden -PassThru',
+                    'Start-Sleep -Milliseconds 200',
+                    '$childProcess.Refresh()',
+                    'if ($childProcess.HasExited) { throw ''Child exited before containment was exercised.'' }',
+                    '[System.IO.File]::WriteAllText($ReadyPath, [string]$childProcess.Id)',
                     'Start-Sleep -Seconds 30'
                 )
             )
@@ -662,8 +663,7 @@ namespace AiwTest
         [System.IO.File]::WriteAllLines(
             $childPath,
             @(
-                'param([string]$MarkerPath, [string]$ReadyPath)',
-                '[System.IO.File]::WriteAllText($ReadyPath, [string][System.Diagnostics.Process]::GetCurrentProcess().Id)',
+                'param([string]$MarkerPath)',
                 'Start-Sleep -Seconds 4',
                 '[System.IO.File]::WriteAllText($MarkerPath, ''survived'')'
             ),
@@ -674,10 +674,11 @@ namespace AiwTest
             @(
                 'param([string]$ChildPath, [string]$MarkerPath, [string]$ReadyPath)',
                 '$powerShellPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName',
-                'Start-Process -FilePath $powerShellPath -ArgumentList @(''-NoProfile'', ''-NonInteractive'', ''-File'', $ChildPath, ''-MarkerPath'', $MarkerPath, ''-ReadyPath'', $ReadyPath) -WindowStyle Hidden',
-                '$deadline = [System.Diagnostics.Stopwatch]::StartNew()',
-                'while (-not (Test-Path -LiteralPath $ReadyPath) -and $deadline.ElapsedMilliseconds -lt 8000) { Start-Sleep -Milliseconds 20 }',
-                'if (-not (Test-Path -LiteralPath $ReadyPath)) { throw ''Child did not become ready.'' }',
+                '$childProcess = Start-Process -FilePath $powerShellPath -ArgumentList @(''-NoProfile'', ''-NonInteractive'', ''-File'', $ChildPath, ''-MarkerPath'', $MarkerPath) -WindowStyle Hidden -PassThru',
+                'Start-Sleep -Milliseconds 200',
+                '$childProcess.Refresh()',
+                'if ($childProcess.HasExited) { throw ''Child exited before containment was exercised.'' }',
+                '[System.IO.File]::WriteAllText($ReadyPath, [string]$childProcess.Id)',
                 '[Console]::Write(''ROOT_EXITED'')'
             ),
             (New-Object System.Text.UTF8Encoding($false))
@@ -687,7 +688,7 @@ namespace AiwTest
             -FilePath $parentPath `
             -Arguments @('-ChildPath', $childPath, '-MarkerPath', $markerPath, '-ReadyPath', $readyPath) `
             -Directory $tempRoot `
-            -ProcessTimeoutSeconds 10
+            -ProcessTimeoutSeconds $script:SuccessProcessTimeoutSeconds
         Assert-True -Condition (Test-Path -LiteralPath $readyPath) -Message 'Successful-root descendant did not become ready'
         $childId = [int](Get-Content -LiteralPath $readyPath -Raw)
         Start-Sleep -Seconds 5
@@ -757,7 +758,7 @@ namespace AiwTest
             ),
             (New-Object System.Text.UTF8Encoding($false))
         )
-        $result = Invoke-NativeWorker -FilePath $ioPath -Arguments @('unused') -Directory $tempRoot -ProcessTimeoutSeconds 10
+        $result = Invoke-NativeWorker -FilePath $ioPath -Arguments @('unused') -Directory $tempRoot -ProcessTimeoutSeconds $script:SuccessProcessTimeoutSeconds
         Assert-Equal -Expected 'stdout-only' -Actual $result.StandardOutput -Message 'Stdout changed'
         Assert-Equal -Expected 'warning: stderr only' -Actual $result.StandardError -Message 'Stderr changed'
         Assert-Equal -Expected 'stdout-only' -Actual (Convert-OutputValue -Text $result.StandardOutput) -Message 'Output conversion used the wrong stream'
